@@ -16,9 +16,29 @@ from typing import Any, Callable, Dict, List, Tuple, Union
 import numpy as np
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:  # 无 opencv 的环境回退 PIL 解码
+    cv2 = None
+
 from gym_donkeycar.core.fps import FPSTimer
 from gym_donkeycar.core.message import IMesgHandler
 from gym_donkeycar.core.sim_client import SimClient
+
+
+def _decode_jpeg_to_rgb(jpg_bytes: bytes) -> np.ndarray:
+    """JPEG bytes -> RGB ndarray。
+
+    cv2 路径优先:解码期释放 GIL 且比 PIL 快——车端进程里采集线程要与 WebRTC
+    编码、车辆主循环抢 GIL,PIL 慢路径会把遥测消费速率拖低,TCP 管道反压回
+    模拟器发送线程,源帧率被钉在 ~52Hz(见 SDClient.connect 的大缓冲注释)。
+    """
+    if cv2 is not None:
+        img = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    image = Image.open(BytesIO(jpg_bytes))
+    return np.asarray(image)
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +111,17 @@ class DonkeyUnitySimContoller:
 
     def wait_until_loaded(self) -> None:
         time.sleep(0.1)
+        deadline = time.time() + 15.0
         while not self.handler.loaded:
+            client = getattr(self.handler, "client", None)
+            if client is None or not getattr(client, "do_process_msgs", True):
+                # 连接已停止：不再无限等待场景加载（避免调用线程被困死）
+                break
+            if time.time() > deadline:
+                # 模拟器接了连接但一直不出场景：超时放行，交给上层
+                # 看门狗/健康检查决定是否重建，不让调用线程永久卡死
+                logger.warning("wait_until_loaded timeout, continue anyway")
+                break
             logger.warning("waiting for sim to start..")
             time.sleep(1.0)
         logger.info("sim started!")
@@ -200,7 +230,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.client = None
 
     def on_abort(self, message: Dict[str, Any]) -> None:
-        self.client.stop()
+        if self.client is not None:
+            self.client.stop()
+        # 清掉 handler 的 client 引用：上层（dgym）健康探测与 observe()
+        # 的自旋逃逸都依赖它感知失联
+        self.on_disconnect()
 
     def on_need_car_config(self, message: Dict[str, Any]) -> None:
         logger.info("on need car config")
@@ -432,7 +466,18 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        spin_deadline = time.time() + 15.0
         while self.last_received == self.time_received:
+            client = self.client
+            if client is None or not getattr(client, "do_process_msgs", True):
+                # 连接已停止：不再等待新遥测，立即返回旧观测。
+                # 否则调用方（车端 step 线程）会在此永久自旋——连接被
+                # 重建后新 env 无人驱动，表现为模拟器永久掉线。
+                break
+            if time.time() > spin_deadline:
+                # 连接活着但迟迟没有新遥测：也返回旧观测，让调用方的
+                # 看门狗/健康检查接管（重建连接），不让线程永久卡死
+                break
             time.sleep(0.001)
 
         self.last_received = self.time_received
@@ -501,16 +546,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     def on_telemetry(self, message: Dict[str, Any]) -> None:
         img_string = message["image"]
-        image = Image.open(BytesIO(base64.b64decode(img_string)))
+        self.image_array = _decode_jpeg_to_rgb(base64.b64decode(img_string))
 
         # always update the image_array as the observation loop will hang if not changing.
-        self.image_array = np.asarray(image)
         self.time_received = time.time()
 
         if "image_b" in message:
             img_string_b = message["image_b"]
-            image_b = Image.open(BytesIO(base64.b64decode(img_string_b)))
-            self.image_array_b = np.asarray(image_b)
+            self.image_array_b = _decode_jpeg_to_rgb(base64.b64decode(img_string_b))
 
         if "pos_x" in message:
             self.x = message["pos_x"]
