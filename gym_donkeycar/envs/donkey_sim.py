@@ -289,6 +289,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "rot_x",
                     "rot_y",
                     "rot_z",
+                    "fps",
                 ],
             )
             self.send_cam_config(**cam_config)
@@ -311,6 +312,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "rot_x",
                     "rot_y",
                     "rot_z",
+                    "fps",
                 ],
             )
             self.send_cam_config(**cam_config_b, msg_type="cam_config_b")
@@ -357,6 +359,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 "rot_x",
                 "rot_y",
                 "rot_z",
+                "fps",
             ],
         )
         if cam_config != {}:
@@ -777,6 +780,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x: float = 0.0,
         rot_y: float = 0.0,
         rot_z: float = 0.0,
+        fps: float = 0.0,
     ) -> None:
         """Camera config
         set any field to Zero to get the default camera setting.
@@ -803,6 +807,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "rot_y": str(rot_y),
             "rot_z": str(rot_z),
         }
+        # 可选遥测推流帧率:>0 时才发(旧模拟器无 fps 字段解析,缺省即兼容)
+        if fps > 0:
+            msg["fps"] = str(fps)
         self.blocking_send(msg)
         time.sleep(0.1)
 
