@@ -190,6 +190,8 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.state_obs = conf.get("state_obs", False)
         self.spawn_cfg = conf.get("spawn_cfg", None)
         self.done_on_flip = conf.get("done_on_flip", True)
+        # 训练专用:连接中断或等不到新遥测时抛异常(毒化可见),而非静默返回陈旧观测
+        self.raise_on_stale = conf.get("raise_on_stale", False)
         self.done_on_stuck = conf.get("done_on_stuck", True)
         self.stuck_time_thresh = conf.get("stuck_time_thresh", 2.5)
 
@@ -253,6 +255,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.lap_count = 0
 
         # sdsandbox 新遥测字段(RL):缺省保证 determine_episode_over 可用
+        # steps_since_reset 必须在此初始化:车加载后 sim 立刻推异步遥测,
+        # 首个 on_telemetry 早于任何 reset()——只在 _clear_episode_state 初始化
+        # 会让接收线程在首帧抛 AttributeError 死亡,observe() 退化为
+        # 瞬时陈旧观测(假步进,2026-10-18 事故)。
+        self.steps_since_reset = 0
         self.collision_impulse = 0.0
         self.flipped = False
         self.stuck_time = 0.0
@@ -552,10 +559,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 # 连接已停止：不再等待新遥测，立即返回旧观测。
                 # 否则调用方（车端 step 线程）会在此永久自旋——连接被
                 # 重建后新 env 无人驱动，表现为模拟器永久掉线。
+                if self.raise_on_stale:
+                    raise ConnectionError("sim connection lost during observe()")
                 break
             if time.time() > spin_deadline:
                 # 连接活着但迟迟没有新遥测：也返回旧观测，让调用方的
                 # 看门狗/健康检查接管（重建连接），不让线程永久卡死
+                if self.raise_on_stale:
+                    raise TimeoutError("no fresh telemetry within 15s during observe()")
                 break
             time.sleep(0.001)
 
