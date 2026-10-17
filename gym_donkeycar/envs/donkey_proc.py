@@ -14,7 +14,8 @@ class DonkeyUnityProcess:
 
     # ------ Launch Unity Env ----------- #
 
-    def start(self, sim_path: str, host: str = "0.0.0.0", port: int = 9091, headless: bool = False, extra_args: list = None):
+    def start(self, sim_path: str, host: str = "0.0.0.0", port: int = 9091, headless: bool = False,
+              extra_args: list = None, keep_graphics: bool = False):
         if sim_path == "remote":
             return
 
