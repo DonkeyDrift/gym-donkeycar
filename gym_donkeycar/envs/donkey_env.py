@@ -36,6 +36,15 @@ def supply_defaults(conf: Dict[str, Any]) -> None:
         ("steer_limit", 1.0),
         ("throttle_min", 0.0),
         ("throttle_max", 1.0),
+        # RL 协议扩展(sdsandbox P0-P2)
+        ("sync_mode", False),
+        ("sync_time_step", 0.05),
+        ("state_obs", False),
+        ("spawn_cfg", None),
+        ("done_on_flip", True),
+        ("done_on_stuck", True),
+        ("stuck_time_thresh", 2.5),
+        ("sim_args", None),
     ]
 
     if "exe_path" not in conf:
@@ -99,7 +108,13 @@ class DonkeyEnv(gym.Env):
         if "exe_path" in conf:
             self.proc = DonkeyUnityProcess()
             # the unity sim server will bind to the host ip given
-            self.proc.start(conf["exe_path"], host="0.0.0.0", port=conf["port"], headless=conf["headless"])
+            self.proc.start(
+                conf["exe_path"],
+                host="0.0.0.0",
+                port=conf["port"],
+                headless=conf["headless"],
+                extra_args=conf.get("sim_args"),
+            )
 
             # wait for simulator to startup and begin listening
             time.sleep(conf["start_delay"])
@@ -116,8 +131,13 @@ class DonkeyEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # camera sensor data
-        self.observation_space = spaces.Box(0, self.VAL_PER_PIXEL, self.viewer.get_sensor_size(), dtype=np.uint8)
+        # camera sensor data / state vector (RL state_obs 模式)
+        if conf["state_obs"]:
+            self.observation_space = spaces.Box(
+                low=np.float32(-np.inf), high=np.float32(np.inf), shape=self.viewer.get_obs_size(), dtype=np.float32
+            )
+        else:
+            self.observation_space = spaces.Box(0, self.VAL_PER_PIXEL, self.viewer.get_sensor_size(), dtype=np.uint8)
 
         # Initialize numpy random generator
         self.np_random = np.random.default_rng()
@@ -169,7 +189,7 @@ class DonkeyEnv(gym.Env):
         # Activate hand brake, so the car does not move
         self.viewer.handler.send_control(0, 0, 1.0)
         time.sleep(0.1)
-        self.viewer.reset()
+        self.viewer.reset(seed=seed)
         self.viewer.handler.send_control(0, 0, 1.0)
         time.sleep(0.1)
         observation, reward, done, info = self.viewer.observe()

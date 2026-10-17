@@ -11,7 +11,7 @@ import os
 import time
 import types
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -85,6 +85,7 @@ class DonkeyUnitySimContoller:
     def __init__(self, conf: Dict[str, Any]):
         logger.setLevel(conf["log_level"])
 
+        self.conf = conf
         self.address = (conf["host"], conf["port"])
 
         self.handler = DonkeyUnitySimHandler(conf=conf)
@@ -126,11 +127,24 @@ class DonkeyUnitySimContoller:
             time.sleep(1.0)
         logger.info("sim started!")
 
-    def reset(self) -> None:
-        self.handler.reset()
+        # RL 同步步进:车加载完成后进同步模式(每条 control 推进一步并回一帧)
+        if self.conf.get("sync_mode", False):
+            msg = {
+                "msg_type": "step_mode",
+                "step_mode": "synchronous",
+                "time_step": str(self.conf.get("sync_time_step", 0.05)),
+            }
+            self.handler.blocking_send(msg)
+            logger.info("synchronous step mode enabled, time_step=%s", msg["time_step"])
+
+    def reset(self, seed=None) -> None:
+        self.handler.reset(seed=seed)
 
     def get_sensor_size(self) -> Tuple[int, int, int]:
         return self.handler.get_sensor_size()
+
+    def get_obs_size(self):
+        return self.handler.get_obs_size()
 
     def take_action(self, action: np.ndarray):
         self.handler.take_action(action)
@@ -139,6 +153,12 @@ class DonkeyUnitySimContoller:
         return self.handler.observe()
 
     def quit(self) -> None:
+        # 同步模式 best-effort 退出:恢复模拟器全局物理后再断开,发不出去也无所谓
+        if self.conf.get("sync_mode", False):
+            try:
+                self.handler.blocking_send({"msg_type": "step_mode", "step_mode": "asynchronous"})
+            except Exception:
+                logger.debug("failed to send async step_mode on quit", exc_info=True)
         self.client.stop()
 
     def exit_scene(self) -> None:
@@ -155,12 +175,23 @@ class DonkeyUnitySimContoller:
 
 
 class DonkeyUnitySimHandler(IMesgHandler):
+    OBS_VECTOR_SIZE = 8
+
     def __init__(self, conf: Dict[str, Any]):
         self.conf = conf
         self.SceneToLoad = conf["level"]
         self.loaded = False
         self.max_cte = conf["max_cte"]
         self.timer = FPSTimer()
+
+        # RL 协议扩展配置(sdsandbox P0-P2,均有缺省,旧 conf 不受影响)
+        self.sync_mode = conf.get("sync_mode", False)
+        self.sync_time_step = conf.get("sync_time_step", 0.05)
+        self.state_obs = conf.get("state_obs", False)
+        self.spawn_cfg = conf.get("spawn_cfg", None)
+        self.done_on_flip = conf.get("done_on_flip", True)
+        self.done_on_stuck = conf.get("done_on_stuck", True)
+        self.stuck_time_thresh = conf.get("stuck_time_thresh", 2.5)
 
         # sensor size - height, width, depth
         self.camera_img_size = conf["cam_resolution"]
@@ -220,6 +251,15 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.current_lap_time = 0.0
         self.starting_line_index = -1
         self.lap_count = 0
+
+        # sdsandbox 新遥测字段(RL):缺省保证 determine_episode_over 可用
+        self.collision_impulse = 0.0
+        self.flipped = False
+        self.stuck_time = 0.0
+        self.lap = 0
+        self.frame_id = 0
+        self.active_node = 0
+        self.total_nodes = 1
 
     def on_connect(self, client: SimClient) -> None:  # pytype: disable=signature-mismatch
         logger.debug("socket connected")
@@ -423,11 +463,32 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     # ------- Env interface ---------- #
 
-    def reset(self) -> None:
+    def reset(self, seed: Optional[int] = None) -> None:
         logger.debug("reseting")
-        self.send_reset_car()
         self.timer.reset()
-        time.sleep(1)
+
+        if self.sync_mode:
+            # 同步模式:先清状态,再发 reset_car,自旋等模拟器的 reset 应答帧
+            # (timeScale=0 下没有异步流,必须先等到应答再让上层 observe)
+            self._clear_episode_state()
+            self.send_reset_car(seed=seed)
+            deadline = time.time() + 10.0
+            last = self.time_received
+            while self.time_received == last:
+                client = self.client
+                if client is None or not getattr(client, "do_process_msgs", True):
+                    break
+                if time.time() > deadline:
+                    logger.warning("reset: timeout waiting for sync reset answer frame")
+                    break
+                time.sleep(0.001)
+        else:
+            # 异步模式保持原行为:先发复位,睡 1s 让模拟器落地,再清本地状态
+            self.send_reset_car(seed=seed)
+            time.sleep(1)
+            self._clear_episode_state()
+
+    def _clear_episode_state(self) -> None:
         self.image_array = np.zeros(self.camera_img_size)
         self.image_array_b = None
         self.last_obs = self.image_array
@@ -462,7 +523,21 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.pitch = 0.0
         self.yaw = 0.0
 
+        # 新遥测字段一并复位
+        self.collision_impulse = 0.0
+        self.flipped = False
+        self.stuck_time = 0.0
+        self.lap = 0
+        self.frame_id = 0
+        self.active_node = 0
+        self.total_nodes = 1
+
     def get_sensor_size(self) -> Tuple[int, int, int]:
+        return self.camera_img_size
+
+    def get_obs_size(self):
+        if self.state_obs:
+            return (self.OBS_VECTOR_SIZE,)
         return self.camera_img_size
 
     def take_action(self, action: np.ndarray) -> None:
@@ -484,7 +559,26 @@ class DonkeyUnitySimHandler(IMesgHandler):
             time.sleep(0.001)
 
         self.last_received = self.time_received
-        observation = self.image_array
+
+        if self.state_obs:
+            # 状态量观测(无图像遥测模式):8 维定长向量,分量归一化到约 [-1,1]
+            observation = np.array(
+                [
+                    self.cte / 2.0,
+                    self.speed / 10.0,
+                    self.forward_vel / 10.0,
+                    self.yaw / 180.0,
+                    self.gyro_z / 90.0,
+                    self.active_node / max(self.total_nodes, 1),
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
+            self.last_obs = observation
+        else:
+            observation = self.image_array
+
         done = self.is_game_over()
         reward = self.calc_reward(done)
 
@@ -501,6 +595,12 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "car": (self.roll, self.pitch, self.yaw),
             "last_lap_time": self.last_lap_time,
             "lap_count": self.lap_count,
+            "collision_impulse": self.collision_impulse,
+            "flipped": self.flipped,
+            "stuck_time": self.stuck_time,
+            "lap": self.lap,
+            "frame_id": self.frame_id,
+            "state_obs": self.state_obs,
         }
 
         # Add the second image to the dict
@@ -548,8 +648,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
     # ------ Socket interface ----------- #
 
     def on_telemetry(self, message: Dict[str, Any]) -> None:
-        img_string = message["image"]
-        self.image_array = _decode_jpeg_to_rgb(base64.b64decode(img_string))
+        # img_enc="none" 时模拟器省略 image 键,仅解码存在的图像
+        if "image" in message:
+            img_string = message["image"]
+            self.image_array = _decode_jpeg_to_rgb(base64.b64decode(img_string))
 
         # always update the image_array as the observation loop will hang if not changing.
         self.time_received = time.time()
@@ -597,6 +699,22 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # It should be setup in the 4 scenes available now.
         if "cte" in message:
             self.cte = message["cte"]
+
+        # sdsandbox 新遥测字段(RL):始终存在,仍按存在性守卫兼容旧模拟器
+        if "collision_impulse" in message:
+            self.collision_impulse = message["collision_impulse"]
+        if "flipped" in message:
+            self.flipped = message["flipped"]
+        if "stuck_time" in message:
+            self.stuck_time = message["stuck_time"]
+        if "lap" in message:
+            self.lap = message["lap"]
+        if "frame_id" in message:
+            self.frame_id = message["frame_id"]
+        if "activeNode" in message:
+            self.active_node = message["activeNode"]
+        if "totalNodes" in message:
+            self.total_nodes = message["totalNodes"]
 
         if "lidar" in message:
             self.lidar = self.process_lidar_packet(message["lidar"])
@@ -658,6 +776,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
             logger.debug("disqualified")
             self.over = True
 
+        # sdsandbox RL 终止条件:翻车/卡死(遥测字段驱动,可经 conf 关闭)
+        if self.flipped and self.done_on_flip:
+            logger.debug("game over: flipped")
+            self.over = True
+        if self.stuck_time > self.stuck_time_thresh and self.done_on_stuck:
+            logger.debug("game over: stuck")
+            self.over = True
+
         # Disable reset
         if os.environ.get("RACE") == "True":
             self.over = False
@@ -702,8 +828,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
         }
         self.queue_message(msg)
 
-    def send_reset_car(self) -> None:
+    def send_reset_car(self, seed: Optional[int] = None) -> None:
+        # sdsandbox 随机出生:spawn_cfg 带 reset_car 可选字段子集,seed 完全可复现
         msg = {"msg_type": "reset_car"}
+        if self.spawn_cfg:
+            for key, val in self.spawn_cfg.items():
+                msg[key] = val
+        if seed is not None:
+            msg["seed"] = seed
         self.queue_message(msg)
 
     def send_get_scene_names(self) -> None:

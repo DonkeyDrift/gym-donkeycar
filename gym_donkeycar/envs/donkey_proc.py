@@ -14,7 +14,7 @@ class DonkeyUnityProcess:
 
     # ------ Launch Unity Env ----------- #
 
-    def start(self, sim_path: str, host: str = "0.0.0.0", port: int = 9091, headless: bool = False):
+    def start(self, sim_path: str, host: str = "0.0.0.0", port: int = 9091, headless: bool = False, extra_args: list = None):
         if sim_path == "remote":
             return
 
@@ -22,10 +22,14 @@ class DonkeyUnityProcess:
             print(sim_path, "does not exist. you must start sim manually.")
             return
 
-        port_args = ["--port", str(port), "--host", str(host), "-logFile", "unitylog.txt"]
+        # 按端口区分日志文件名,多 sim 实例同目录并行时不再互相覆盖
+        port_args = ["--port", str(port), "--host", str(host), "-logFile", f"unitylog_{port}.txt"]
 
         if headless:
             port_args += ["-batchmode", "-nographics"]
+
+        if extra_args:
+            port_args += list(extra_args)
 
         # Launch Unity environment
         self.proc1 = subprocess.Popen([sim_path] + port_args)
