@@ -844,11 +844,19 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.queue_message(msg)
 
     def send_reset_car(self, seed: Optional[int] = None) -> None:
-        # sdsandbox 随机出生:spawn_cfg 带 reset_car 可选字段子集,seed 完全可复现
+        # sdsandbox 随机出生:spawn_cfg 带 reset_car 可选字段子集,seed 完全可复现。
+        # lateral_offset 带符号随机化(±均匀):固定单侧偏移会训出"只会向右回正"的
+        # 偏科策略,held-out 评测暴露横向恢复弱、全部以越界收场(2026-10-18 基线:
+        # 5 局 crash_rate 1.0,全为 |cte|≈2.6 越界)。seed 决定符号与幅度,可复现。
         msg = {"msg_type": "reset_car"}
         if self.spawn_cfg:
             for key, val in self.spawn_cfg.items():
                 msg[key] = val
+            lat = self.spawn_cfg.get("lateral_offset")
+            if lat and seed is not None:
+                import random as _rnd
+                rng = _rnd.Random((seed, "lat"))
+                msg["lateral_offset"] = round(rng.uniform(-lat, lat), 3)
         if seed is not None:
             msg["seed"] = seed
         self.queue_message(msg)
