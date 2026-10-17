@@ -489,6 +489,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
             self._clear_episode_state()
 
     def _clear_episode_state(self) -> None:
+        self.steps_since_reset = 0
         self.image_array = np.zeros(self.camera_img_size)
         self.image_array_b = None
         self.last_obs = self.image_array
@@ -655,6 +656,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
         # always update the image_array as the observation loop will hang if not changing.
         self.time_received = time.time()
+        self.steps_since_reset += 1
 
         if "image_b" in message:
             img_string_b = message["image_b"]
@@ -759,13 +761,15 @@ class DonkeyUnitySimHandler(IMesgHandler):
         logger.debug("custom ep_over fn set.")
 
     def determine_episode_over(self):
-        # we have a few initial frames on start that are sometimes very large CTE when it's behind
-        # the path just slightly. We ignore those.
-        if math.fabs(self.cte) > 2 * self.max_cte:
-            pass
-        elif math.fabs(self.cte) > self.max_cte:
-            logger.debug(f"game over: cte {self.cte}")
-            self.over = True
+        # 出界判负:|cte|>max_cte 即终止(reset 后前 5 个 step 给宽限,只覆盖出生瞬间
+        # 的异常大 cte;宽限不保护"冲太远"——|cte| 极大同样终止,否则车冲出去后反而
+        # 永不判负,在野外空跑到截断)。
+        if math.fabs(self.cte) > self.max_cte:
+            if self.steps_since_reset < 5 and math.fabs(self.cte) > 2 * self.max_cte:
+                pass
+            else:
+                logger.debug(f"game over: off track cte {self.cte}")
+                self.over = True
         elif self.hit != "none":
             logger.debug(f"game over: hit {self.hit}")
             self.over = True
