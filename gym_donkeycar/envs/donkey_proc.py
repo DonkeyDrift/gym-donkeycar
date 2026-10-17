@@ -26,7 +26,11 @@ class DonkeyUnityProcess:
         port_args = ["--port", str(port), "--host", str(host), "-logFile", f"unitylog_{port}.txt"]
 
         if headless:
-            port_args += ["-batchmode", "-nographics"]
+            # keep_graphics: -batchmode 但保留图形设备——离屏渲染,无窗口/无遮挡休眠,
+            # 相机可用;纯状态量训练用 -nographics 更省
+            port_args += ["-batchmode"]
+            if not keep_graphics:
+                port_args += ["-nographics"]
 
         if extra_args:
             port_args += list(extra_args)
