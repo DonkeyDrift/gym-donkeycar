@@ -114,6 +114,7 @@ class DonkeyEnv(gym.Env):
                 port=conf["port"],
                 headless=conf["headless"],
                 extra_args=conf.get("sim_args"),
+                keep_graphics=conf.get("headless_keep_gfx", False),
             )
 
             # wait for simulator to startup and begin listening
