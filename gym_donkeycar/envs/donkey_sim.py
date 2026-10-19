@@ -194,6 +194,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.raise_on_stale = conf.get("raise_on_stale", False)
         self.done_on_stuck = conf.get("done_on_stuck", True)
         self.stuck_time_thresh = conf.get("stuck_time_thresh", 2.5)
+        # 单因子奖励修复(P3):非截断终止统一扣固定值。默认 0=关闭=旧行为,
+        # 保护状态量轨道全部历史基线可复现(champion2 谱系在旧奖励下训出)。
+        # TimeLimit 截断发生在 gym 包装层,到不了 calc_reward,故 done=True
+        # 即环境终止(cte 越界/hit/翻车/卡死),无需在奖励内再分终止类型。
+        self.crash_penalty = float(conf.get("crash_penalty", 0.0))
 
         # sensor size - height, width, depth
         self.camera_img_size = conf["cam_resolution"]
@@ -645,6 +650,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # max_speed = 10
 
         if done:
+            # 环境终止(非截断):conf 门控时统一扣 crash_penalty(默认 0=旧 -1)
+            if self.crash_penalty > 0.0:
+                return -self.crash_penalty
             return -1.0
 
         if self.cte > self.max_cte:
