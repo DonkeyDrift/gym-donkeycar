@@ -199,6 +199,13 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # TimeLimit 截断发生在 gym 包装层,到不了 calc_reward,故 done=True
         # 即环境终止(cte 越界/hit/翻车/卡死),无需在奖励内再分终止类型。
         self.crash_penalty = float(conf.get("crash_penalty", 0.0))
+        # 奖励 v2(P3 杀停车漏洞):滑动窗内累计位移 < no_progress_dist 米即终止,
+        # 与 crash_penalty 同罚(默认 0=关,保护历史基线;窗位用遥测 pos 位移累加,
+        # 同步/异步通用,无需 dt)。
+        self.no_progress_timeout = float(conf.get("no_progress_timeout", 0.0))
+        self.no_progress_dist = float(conf.get("no_progress_dist", 1.0))
+        self._np_window = []  # [(wall_time, 累计位移)]
+        self._np_last_pos = None
 
         # sensor size - height, width, depth
         self.camera_img_size = conf["cam_resolution"]
@@ -547,6 +554,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.lap = 0
         self.frame_id = 0
         self.active_node = 0
+        # 奖励 v2 无进展滑窗复位(episode 边界不清零会跨局误杀)
+        self._np_window = []
+        self._np_last_pos = None
         self.total_nodes = 1
 
     def get_sensor_size(self) -> Tuple[int, int, int]:
@@ -601,6 +611,8 @@ class DonkeyUnitySimHandler(IMesgHandler):
             observation = self.image_array
 
         done = self.is_game_over()
+        if not done and self.no_progress_timeout > 0.0:
+            done = self._check_no_progress()
         reward = self.calc_reward(done)
 
         info = {
@@ -631,6 +643,29 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # self.timer.on_frame()
 
         return observation, reward, done, info
+
+    def _check_no_progress(self) -> bool:
+        """奖励 v2:滑动窗(默认 10s)内遥测 pos 累计位移 < no_progress_dist(默认 1m)
+        即终止——杀停车漏洞(crash_penalty 只罚死不罚不动时,弱策略停车最优)。
+        窗内位移=相邻遥测 pos 欧氏距离分段累加,同步/异步通用。"""
+        now = time.time()
+        pos = (self.x, self.y, self.z)
+        if self._np_last_pos is not None:
+            import math as _m
+            self._np_window.append((now, _m.dist(pos, self._np_last_pos)))
+        self._np_last_pos = pos
+        self._np_window = [(t, s) for t, s in self._np_window if t >= now - self.no_progress_timeout]
+        if not self._np_window:
+            return False
+        span = now - self._np_window[0][0]
+        dist = sum(s for _, s in self._np_window)
+        # 窗满判定留 0.25s 容差:修剪用 t >= now-timeout,最老帧比 now-timeout 新
+        # 最多一个步长,span 永远差一步到不了 timeout(2026-10-20 探针实测定案)
+        if span >= self.no_progress_timeout - 0.25 and dist < self.no_progress_dist:
+            logger.debug(f"game over: no progress {dist:.2f}m in {span:.1f}s")
+            self.over = True
+            return True
+        return False
 
     def is_game_over(self) -> bool:
         return self.over
