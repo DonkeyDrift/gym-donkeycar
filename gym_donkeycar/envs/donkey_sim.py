@@ -351,6 +351,12 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "fps",
                 ],
             )
+            # cam_resolution 原生映射:客户端缓冲尺寸必须同步给 sim 相机,
+            # 否则 sim 按默认 120×160 出图、本地按 240×320 解码,空间与实际
+            # 观测错位(2026-10-20 分辨率路线探针实测)。
+            if "img_w" not in cam_config and "img_h" not in cam_config and getattr(self, "camera_img_size", None):
+                cam_config["img_w"] = self.camera_img_size[1]
+                cam_config["img_h"] = self.camera_img_size[0]
             self.send_cam_config(**cam_config)
             logger.info(f"done sending cam config. {cam_config}")
 
