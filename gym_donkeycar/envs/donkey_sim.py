@@ -445,7 +445,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 conf["body_rgb"],
                 conf["car_name"],
                 conf["font_size"],
+                ctl_step_ms=conf.get("ctl_step_ms"),
             )
+        elif conf.get("ctl_step_ms"):
+            # 只给量化控制字段时也发完整 car_config(sim 端解析需要 body_* 键)
+            self.send_car_config(ctl_step_ms=conf["ctl_step_ms"])
 
     def set_racer_bio(self, conf: Dict[str, Any]) -> None:
         if "bio" in conf:
@@ -879,6 +883,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         body_rgb: Tuple[int, int, int] = (255, 255, 255),
         car_name: str = "car",
         font_size: int = 100,
+        ctl_step_ms: int = None,
     ):
         """
         # body_style = "donkey" | "bare" | "car01" | "f1" | "cybertruck"
@@ -900,6 +905,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "car_name": car_name,
             "font_size": str(font_size),
         }
+        # 量化异步控制(相位协议):>0 时 sim 把控制应用与遥测对齐到物理网格边界,
+        # 动作-观测配对与同步步进 time_step=ctl_step 同构;None/0=旧行为。
+        if ctl_step_ms:
+            msg["ctl_step_ms"] = str(int(ctl_step_ms))
         self.blocking_send(msg)
         time.sleep(0.1)
 
