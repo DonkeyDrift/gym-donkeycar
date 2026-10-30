@@ -206,6 +206,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.no_progress_dist = float(conf.get("no_progress_dist", 1.0))
         self._np_window = []  # [(wall_time, 累计位移)]
         self._np_last_pos = None
+        # INFLIGHT: 在飞指令入观测(8→12 维)。默认关,保护历史基线。
+        # obs = [...8维状态, a_{k-1}.steer, a_{k-1}.thr, a_{k-2}.steer, a_{k-2}.thr]
+        self.obs_inflight = bool(conf.get("obs_inflight", False))
+        self._inflight = [np.zeros(2, dtype=np.float32),
+                          np.zeros(2, dtype=np.float32)]  # [prev, last]
 
         # sensor size - height, width, depth
         self.camera_img_size = conf["cam_resolution"]
@@ -552,6 +557,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
+        # INFLIGHT: reset 后清零在飞指令
+        self._inflight = [np.zeros(2, dtype=np.float32),
+                          np.zeros(2, dtype=np.float32)]
 
         # 新遥测字段一并复位
         self.collision_impulse = 0.0
@@ -570,10 +578,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     def get_obs_size(self):
         if self.state_obs:
-            return (self.OBS_VECTOR_SIZE,)
+            base = self.OBS_VECTOR_SIZE + (4 if self.obs_inflight else 0)
+            return (base,)
         return self.camera_img_size
 
     def take_action(self, action: np.ndarray) -> None:
+        if self.obs_inflight:
+            self._inflight[0] = self._inflight[1]
+            self._inflight[1] = np.asarray([action[0], action[1]], dtype=np.float32)
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
@@ -612,6 +624,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 ],
                 dtype=np.float32,
             )
+            if self.obs_inflight:
+                # INFLIGHT: 追加在飞指令 [a_{k-1}.steer, a_{k-1}.thr, a_{k-2}.steer, a_{k-2}.thr]
+                # _inflight[1]=最新 take_action(a_{k-1}),_inflight[0]=a_{k-2},最新在前
+                observation = np.concatenate([observation, self._inflight[1], self._inflight[0]])
             self.last_obs = observation
         else:
             observation = self.image_array
