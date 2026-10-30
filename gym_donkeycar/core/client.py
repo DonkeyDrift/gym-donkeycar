@@ -39,6 +39,10 @@ class SDClient:
 
     def connect(self) -> None:
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 60fps 遥测(~60KB/帧):默认接收缓冲只够几条消息,消费抖动会反压
+        # 模拟器发送线程;8MB 缓冲 + 关 Nagle(小包控制即时送达)。
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # connecting to the server
         logger.info("connecting to %s:%d " % (self.host, self.port))

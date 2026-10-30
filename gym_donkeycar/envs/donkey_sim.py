@@ -13,6 +13,7 @@ import types
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Tuple, Union
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -255,6 +256,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "rot_x",
                     "rot_y",
                     "rot_z",
+                    "fps",
                 ],
             )
             self.send_cam_config(**cam_config)
@@ -323,6 +325,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 "rot_x",
                 "rot_y",
                 "rot_z",
+                "fps",
             ],
         )
         if cam_config != {}:
@@ -501,16 +504,18 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     def on_telemetry(self, message: Dict[str, Any]) -> None:
         img_string = message["image"]
-        image = Image.open(BytesIO(base64.b64decode(img_string)))
+        # cv2.imdecode 解码时释放 GIL(PIL 持锁),60fps 下不与 WebRTC 编码线程抢核;
+        # imdecode 输出 BGR,转 RGB 保持与 PIL 输出语义一致。
+        jpg = np.frombuffer(base64.b64decode(img_string), dtype=np.uint8)
 
         # always update the image_array as the observation loop will hang if not changing.
-        self.image_array = np.asarray(image)
+        self.image_array = cv2.cvtColor(cv2.imdecode(jpg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
         self.time_received = time.time()
 
         if "image_b" in message:
             img_string_b = message["image_b"]
-            image_b = Image.open(BytesIO(base64.b64decode(img_string_b)))
-            self.image_array_b = np.asarray(image_b)
+            jpg_b = np.frombuffer(base64.b64decode(img_string_b), dtype=np.uint8)
+            self.image_array_b = cv2.cvtColor(cv2.imdecode(jpg_b, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
         if "pos_x" in message:
             self.x = message["pos_x"]
@@ -734,6 +739,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x: float = 0.0,
         rot_y: float = 0.0,
         rot_z: float = 0.0,
+        fps: int = 0,
     ) -> None:
         """Camera config
         set any field to Zero to get the default camera setting.
@@ -743,6 +749,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x will rotate the camera
         with fish_eye_x/y == 0.0 then you get no distortion
         img_enc can be one of JPG|PNG|TGA
+        fps requests the telemetry push rate (DonkeyDrift sim patch; 0 = sim default 20)
         """
         msg = {
             "msg_type": msg_type,
@@ -760,6 +767,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "rot_y": str(rot_y),
             "rot_z": str(rot_z),
         }
+        if fps:
+            # 仅显式请求时才发键:旧模拟器协议无此键,保持报文逐字节兼容
+            msg["fps"] = str(fps)
         self.blocking_send(msg)
         time.sleep(0.1)
 
