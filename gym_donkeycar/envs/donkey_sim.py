@@ -91,10 +91,17 @@ class DonkeyUnitySimContoller:
         self.handler.set_episode_over_fn(ep_over_fn)
 
     def wait_until_loaded(self) -> None:
-        time.sleep(0.1)
-        while not self.handler.loaded:
-            logger.warning("waiting for sim to start..")
-            time.sleep(1.0)
+        deadline = time.monotonic() + self.handler.observe_timeout
+        try:
+            while not self.handler.loaded:
+                if not self.client.is_connected():
+                    raise ConnectionError("simulator disconnected while loading")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("simulator did not load before the timeout")
+                time.sleep(0.01)
+        except Exception:
+            self.client.stop()
+            raise
         logger.info("sim started!")
 
     def reset(self) -> None:
@@ -140,6 +147,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.last_obs = self.image_array
         self.time_received = time.time()
         self.last_received = self.time_received
+        self.last_telemetry_ts = 0.0
+        self.observe_timeout = float(conf.get("observe_timeout", 5.0))
+        if not math.isfinite(self.observe_timeout) or self.observe_timeout <= 0:
+            raise ValueError("observe_timeout must be finite and greater than zero")
         self.hit = "none"
         self.cte = 0.0
         self.x = 0.0
@@ -200,8 +211,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
         logger.debug("socket disconnected")
         self.client = None
 
+    def on_close(self) -> None:
+        self.on_disconnect()
+
     def on_abort(self, message: Dict[str, Any]) -> None:
-        self.client.stop()
+        client = self.client
+        self.on_disconnect()
+        if client is not None:
+            client.stop()
 
     def on_need_car_config(self, message: Dict[str, Any]) -> None:
         logger.info("on need car config")
@@ -435,9 +452,16 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        deadline = time.monotonic() + self.observe_timeout
         while self.last_received == self.time_received:
+            if self.client is None or not self.client.is_connected():
+                raise ConnectionError("simulator disconnected while waiting for telemetry")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("no new simulator telemetry before the timeout")
             time.sleep(0.001)
 
+        if self.client is None or not self.client.is_connected():
+            raise ConnectionError("simulator disconnected before observation")
         self.last_received = self.time_received
         observation = self.image_array
         done = self.is_game_over()
@@ -510,6 +534,8 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
         # always update the image_array as the observation loop will hang if not changing.
         self.image_array = cv2.cvtColor(cv2.imdecode(jpg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        # Unlike time_received, this timestamp is never advanced by reset().
+        self.last_telemetry_ts = time.time()
         self.time_received = time.time()
 
         if "image_b" in message:

@@ -15,7 +15,7 @@ import logging
 import select
 import socket
 import time
-from threading import Thread
+from threading import Thread, current_thread
 from typing import Any, Dict
 
 from .util import replace_float_notation
@@ -39,6 +39,7 @@ class SDClient:
 
     def connect(self) -> None:
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.settimeout(5.0)
         # 60fps 遥测(~60KB/帧):默认接收缓冲只够几条消息,消费抖动会反压
         # 模拟器发送线程;8MB 缓冲 + 关 Nagle(小包控制即时送达)。
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
@@ -49,12 +50,16 @@ class SDClient:
         try:
             self.s.connect((self.host, self.port))
         except ConnectionRefusedError:
+            self.s.close()
             raise (
                 Exception(
                     "Could not connect to server. Is it running? "
                     "If you specified 'remote', then you must start it manually."
                 )
             )
+        except OSError:
+            self.s.close()
+            raise
 
         # time.sleep(pause_on_create)
         self.do_process_msgs = True
@@ -72,13 +77,20 @@ class SDClient:
         logger.debug("got:" + j["msg_type"])
 
     def stop(self) -> None:
-        # signal proc_msg loop to stop, then wait for thread to finish
-        # close socket
         self.do_process_msgs = False
-        if self.th is not None:
-            self.th.join()
+        self.aborted = True
+        # Wake socket I/O before joining; abort callbacks may run on this thread.
         if self.s is not None:
+            try:
+                self.s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.s.close()
+        if self.th is not None and self.th is not current_thread():
+            self.th.join(timeout=1.0)
+
+    def is_connected(self) -> bool:
+        return not self.aborted and self.do_process_msgs and self.s.fileno() != -1
 
     def proc_msg(self, sock: socket.socket) -> None:  # noqa: C901
         """
@@ -88,7 +100,11 @@ class SDClient:
         And we will read any messages when it's in a readable state and then
         call self.on_msg_recv with the json object message.
         """
-        sock.setblocking(False)
+        try:
+            sock.setblocking(False)
+        except OSError:
+            self.stop()
+            return
         inputs = [sock]
         outputs = [sock]
         localbuffer = ""
@@ -99,16 +115,12 @@ class SDClient:
             time.sleep(self.poll_socket_sleep_sec)
             try:
                 # test our socket for readable, writable states.
-                readable, writable, exceptional = select.select(inputs, outputs, inputs)
+                readable, writable, exceptional = select.select(inputs, outputs, inputs, 0.1)
 
                 for s in readable:
-                    try:
-                        data = s.recv(1024 * 256)
-                    except ConnectionAbortedError:
-                        logger.warn("socket connection aborted")
-                        print("socket connection aborted")
-                        self.do_process_msgs = False
-                        break
+                    data = s.recv(1024 * 256)
+                    if not data:
+                        raise ConnectionError("simulator closed the connection")
 
                     # we don't technically need to convert from bytes to string
                     # for json.loads, but we do need a string in order to do
@@ -124,6 +136,8 @@ class SDClient:
                         localbuffer = localbuffer[n1:]
 
                         for m in msgs:
+                            if not self.do_process_msgs:
+                                break
                             if len(m) <= 2:
                                 continue
                             # Replace comma with dots for floats
@@ -150,10 +164,16 @@ class SDClient:
                         self.msg = None
 
                 if len(exceptional) > 0:
-                    logger.error("problems w sockets!")
+                    raise ConnectionError("simulator socket exception")
 
             except Exception as e:
-                print("Exception:", e)
-                self.aborted = True
-                self.on_msg_recv({"msg_type": "aborted"})
+                if self.do_process_msgs:
+                    logger.warning("simulator connection lost: %s", e)
+                    self.aborted = True
+                    self.do_process_msgs = False
+                    try:
+                        self.on_msg_recv({"msg_type": "aborted"})
+                    except Exception:
+                        logger.exception("simulator disconnect callback failed")
+                self.stop()
                 break
