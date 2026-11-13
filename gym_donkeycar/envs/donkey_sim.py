@@ -112,13 +112,18 @@ class DonkeyUnitySimContoller:
         self.handler.set_episode_over_fn(ep_over_fn)
 
     def wait_until_loaded(self) -> None:
-        deadline = time.monotonic() + self.handler.observe_timeout
+        strict_timeout = self.handler.raise_on_stale or "observe_timeout" in self.handler.conf
+        timeout = self.handler.observe_timeout if strict_timeout else 15.0
+        deadline = time.monotonic() + timeout
         try:
             while not self.handler.loaded:
                 if not self.client.is_connected():
                     raise ConnectionError("simulator disconnected while loading")
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("simulator did not load before the timeout")
+                    if strict_timeout:
+                        raise TimeoutError("simulator did not load before the timeout")
+                    logger.warning("wait_until_loaded timed out; continuing with the connection open")
+                    break
                 time.sleep(0.01)
         except Exception:
             self.client.stop()

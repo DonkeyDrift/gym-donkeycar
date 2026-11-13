@@ -365,3 +365,18 @@ def test_wait_until_loaded_timeout_stops_client_first():
     with pytest.raises(TimeoutError):
         controller.wait_until_loaded()
     assert stopped == [True]
+
+
+def test_wait_until_loaded_default_timeout_keeps_legacy_fallback():
+    controller = DonkeyUnitySimContoller.__new__(DonkeyUnitySimContoller)
+    controller.handler = _handler_with_mock_client()
+    controller.conf = {}
+    stopped = []
+    controller.client = SimpleNamespace(is_connected=lambda: True, stop=lambda: stopped.append(True))
+
+    with patch("gym_donkeycar.envs.donkey_sim.time.monotonic", side_effect=[0.0, 16.0]), patch(
+        "gym_donkeycar.envs.donkey_sim.time.sleep"
+    ):
+        controller.wait_until_loaded()
+
+    assert stopped == []
