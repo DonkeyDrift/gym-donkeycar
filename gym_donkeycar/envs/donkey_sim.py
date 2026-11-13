@@ -11,15 +11,35 @@ import os
 import time
 import types
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 from PIL import Image
+
+try:
+    import cv2
+except ImportError:  # 无 opencv 的环境回退 PIL 解码
+    cv2 = None
 
 from gym_donkeycar.core.fps import FPSTimer
 from gym_donkeycar.core.message import IMesgHandler
 from gym_donkeycar.core.sim_client import SimClient
+
+
+def _decode_jpeg_to_rgb(jpg_bytes: bytes) -> np.ndarray:
+    """JPEG bytes -> RGB ndarray。
+
+    cv2 路径优先:解码期释放 GIL 且比 PIL 快——车端进程里采集线程要与 WebRTC
+    编码、车辆主循环抢 GIL,PIL 慢路径会把遥测消费速率拖低,TCP 管道反压回
+    模拟器发送线程,源帧率被钉在 ~52Hz(见 SDClient.connect 的大缓冲注释)。
+    """
+    if cv2 is not None:
+        img = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    image = Image.open(BytesIO(jpg_bytes))
+    return np.asarray(image)
+
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +86,7 @@ class DonkeyUnitySimContoller:
     def __init__(self, conf: Dict[str, Any]):
         logger.setLevel(conf["log_level"])
 
+        self.conf = conf
         self.address = (conf["host"], conf["port"])
 
         self.handler = DonkeyUnitySimHandler(conf=conf)
@@ -104,11 +125,24 @@ class DonkeyUnitySimContoller:
             raise
         logger.info("sim started!")
 
-    def reset(self) -> None:
-        self.handler.reset()
+        # RL 同步步进:车加载完成后进同步模式(每条 control 推进一步并回一帧)
+        if self.conf.get("sync_mode", False):
+            msg = {
+                "msg_type": "step_mode",
+                "step_mode": "synchronous",
+                "time_step": str(self.conf.get("sync_time_step", 0.05)),
+            }
+            self.handler.blocking_send(msg)
+            logger.info("synchronous step mode enabled, time_step=%s", msg["time_step"])
+
+    def reset(self, seed=None) -> None:
+        self.handler.reset(seed=seed)
 
     def get_sensor_size(self) -> Tuple[int, int, int]:
         return self.handler.get_sensor_size()
+
+    def get_obs_size(self):
+        return self.handler.get_obs_size()
 
     def take_action(self, action: np.ndarray):
         self.handler.take_action(action)
@@ -117,6 +151,12 @@ class DonkeyUnitySimContoller:
         return self.handler.observe()
 
     def quit(self) -> None:
+        # 同步模式 best-effort 退出:恢复模拟器全局物理后再断开,发不出去也无所谓
+        if self.conf.get("sync_mode", False):
+            try:
+                self.handler.blocking_send({"msg_type": "step_mode", "step_mode": "asynchronous"})
+            except Exception:
+                logger.debug("failed to send async step_mode on quit", exc_info=True)
         self.client.stop()
 
     def exit_scene(self) -> None:
@@ -133,12 +173,41 @@ class DonkeyUnitySimContoller:
 
 
 class DonkeyUnitySimHandler(IMesgHandler):
+    OBS_VECTOR_SIZE = 8
+
     def __init__(self, conf: Dict[str, Any]):
         self.conf = conf
         self.SceneToLoad = conf["level"]
         self.loaded = False
         self.max_cte = conf["max_cte"]
         self.timer = FPSTimer()
+
+        # RL 协议扩展配置(sdsandbox P0-P2,均有缺省,旧 conf 不受影响)
+        self.sync_mode = conf.get("sync_mode", False)
+        self.sync_time_step = conf.get("sync_time_step", 0.05)
+        self.state_obs = conf.get("state_obs", False)
+        self.spawn_cfg = conf.get("spawn_cfg", None)
+        self.done_on_flip = conf.get("done_on_flip", True)
+        # 训练专用:连接中断或等不到新遥测时抛异常(毒化可见),而非静默返回陈旧观测
+        self.raise_on_stale = conf.get("raise_on_stale", False)
+        self.done_on_stuck = conf.get("done_on_stuck", True)
+        self.stuck_time_thresh = conf.get("stuck_time_thresh", 2.5)
+        # 单因子奖励修复(P3):非截断终止统一扣固定值。默认 0=关闭=旧行为,
+        # 保护状态量轨道全部历史基线可复现(champion2 谱系在旧奖励下训出)。
+        # TimeLimit 截断发生在 gym 包装层,到不了 calc_reward,故 done=True
+        # 即环境终止(cte 越界/hit/翻车/卡死),无需在奖励内再分终止类型。
+        self.crash_penalty = float(conf.get("crash_penalty", 0.0))
+        # 奖励 v2(P3 杀停车漏洞):滑动窗内累计位移 < no_progress_dist 米即终止,
+        # 与 crash_penalty 同罚(默认 0=关,保护历史基线;窗位用遥测 pos 位移累加,
+        # 同步/异步通用,无需 dt)。
+        self.no_progress_timeout = float(conf.get("no_progress_timeout", 0.0))
+        self.no_progress_dist = float(conf.get("no_progress_dist", 1.0))
+        self._np_window = []  # [(wall_time, 累计位移)]
+        self._np_last_pos = None
+        # INFLIGHT: 在飞指令入观测(8→12 维)。默认关,保护历史基线。
+        # obs = [...8维状态, a_{k-1}.steer, a_{k-1}.thr, a_{k-2}.steer, a_{k-2}.thr]
+        self.obs_inflight = bool(conf.get("obs_inflight", False))
+        self._inflight = [np.zeros(2, dtype=np.float32), np.zeros(2, dtype=np.float32)]  # [prev, last]
 
         # sensor size - height, width, depth
         self.camera_img_size = conf["cam_resolution"]
@@ -202,6 +271,20 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.current_lap_time = 0.0
         self.starting_line_index = -1
         self.lap_count = 0
+
+        # sdsandbox 新遥测字段(RL):缺省保证 determine_episode_over 可用
+        # steps_since_reset 必须在此初始化:车加载后 sim 立刻推异步遥测,
+        # 首个 on_telemetry 早于任何 reset()——只在 _clear_episode_state 初始化
+        # 会让接收线程在首帧抛 AttributeError 死亡,observe() 退化为
+        # 瞬时陈旧观测(假步进,2026-10-18 事故)。
+        self.steps_since_reset = 0
+        self.collision_impulse = 0.0
+        self.flipped = False
+        self.stuck_time = 0.0
+        self.lap = 0
+        self.frame_id = 0
+        self.active_node = 0
+        self.total_nodes = 1
 
     def on_connect(self, client: SimClient) -> None:  # pytype: disable=signature-mismatch
         logger.debug("socket connected")
@@ -276,6 +359,12 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "fps",
                 ],
             )
+            # cam_resolution 原生映射:客户端缓冲尺寸必须同步给 sim 相机,
+            # 否则 sim 按默认 120×160 出图、本地按 240×320 解码,空间与实际
+            # 观测错位(2026-10-20 分辨率路线探针实测)。
+            if "img_w" not in cam_config and "img_h" not in cam_config and getattr(self, "camera_img_size", None):
+                cam_config["img_w"] = self.camera_img_size[1]
+                cam_config["img_h"] = self.camera_img_size[0]
             self.send_cam_config(**cam_config)
             logger.info(f"done sending cam config. {cam_config}")
 
@@ -296,6 +385,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "rot_x",
                     "rot_y",
                     "rot_z",
+                    "fps",
                 ],
             )
             self.send_cam_config(**cam_config_b, msg_type="cam_config_b")
@@ -381,7 +471,11 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 conf["body_rgb"],
                 conf["car_name"],
                 conf["font_size"],
+                ctl_step_ms=conf.get("ctl_step_ms"),
             )
+        elif conf.get("ctl_step_ms"):
+            # 只给量化控制字段时也发完整 car_config(sim 端解析需要 body_* 键)
+            self.send_car_config(ctl_step_ms=conf["ctl_step_ms"])
 
     def set_racer_bio(self, conf: Dict[str, Any]) -> None:
         if "bio" in conf:
@@ -406,11 +500,33 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     # ------- Env interface ---------- #
 
-    def reset(self) -> None:
+    def reset(self, seed: Optional[int] = None) -> None:
         logger.debug("reseting")
-        self.send_reset_car()
         self.timer.reset()
-        time.sleep(1)
+
+        if self.sync_mode:
+            # 同步模式:先清状态,再发 reset_car,自旋等模拟器的 reset 应答帧
+            # (timeScale=0 下没有异步流,必须先等到应答再让上层 observe)
+            self._clear_episode_state()
+            self.send_reset_car(seed=seed)
+            deadline = time.time() + 10.0
+            last = self.time_received
+            while self.time_received == last:
+                client = self.client
+                if client is None or not getattr(client, "do_process_msgs", True):
+                    break
+                if time.time() > deadline:
+                    logger.warning("reset: timeout waiting for sync reset answer frame")
+                    break
+                time.sleep(0.001)
+        else:
+            # 异步模式保持原行为:先发复位,睡 1s 让模拟器落地,再清本地状态
+            self.send_reset_car(seed=seed)
+            time.sleep(1)
+            self._clear_episode_state()
+
+    def _clear_episode_state(self) -> None:
+        self.steps_since_reset = 0
         self.image_array = np.zeros(self.camera_img_size)
         self.image_array_b = None
         self.last_obs = self.image_array
@@ -444,27 +560,82 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
+        # INFLIGHT: reset 后清零在飞指令
+        self._inflight = [np.zeros(2, dtype=np.float32), np.zeros(2, dtype=np.float32)]
+
+        # 新遥测字段一并复位
+        self.collision_impulse = 0.0
+        self.flipped = False
+        self.stuck_time = 0.0
+        self.lap = 0
+        self.frame_id = 0
+        self.active_node = 0
+        # 奖励 v2 无进展滑窗复位(episode 边界不清零会跨局误杀)
+        self._np_window = []
+        self._np_last_pos = None
+        self.total_nodes = 1
 
     def get_sensor_size(self) -> Tuple[int, int, int]:
         return self.camera_img_size
 
+    def get_obs_size(self):
+        if self.state_obs:
+            base = self.OBS_VECTOR_SIZE + (4 if self.obs_inflight else 0)
+            return (base,)
+        return self.camera_img_size
+
     def take_action(self, action: np.ndarray) -> None:
+        if self.obs_inflight:
+            self._inflight[0] = self._inflight[1]
+            self._inflight[1] = np.asarray([action[0], action[1]], dtype=np.float32)
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        strict_stale = self.raise_on_stale or "observe_timeout" in self.conf
         deadline = time.monotonic() + self.observe_timeout
         while self.last_received == self.time_received:
             if self.client is None or not self.client.is_connected():
-                raise ConnectionError("simulator disconnected while waiting for telemetry")
+                if strict_stale:
+                    raise ConnectionError("simulator disconnected while waiting for telemetry")
+                break
             if time.monotonic() >= deadline:
-                raise TimeoutError("no new simulator telemetry before the timeout")
+                if strict_stale:
+                    raise TimeoutError("no new simulator telemetry before the timeout")
+                logger.warning("simulator telemetry stale; returning the last observation")
+                break
             time.sleep(0.001)
 
         if self.client is None or not self.client.is_connected():
-            raise ConnectionError("simulator disconnected before observation")
+            if strict_stale:
+                raise ConnectionError("simulator disconnected before observation")
         self.last_received = self.time_received
-        observation = self.image_array
+
+        if self.state_obs:
+            # 状态量观测(无图像遥测模式):8 维定长向量,分量归一化到约 [-1,1]
+            observation = np.array(
+                [
+                    self.cte / 2.0,
+                    self.speed / 10.0,
+                    self.forward_vel / 10.0,
+                    self.yaw / 180.0,
+                    self.gyro_z / 90.0,
+                    self.active_node / max(self.total_nodes, 1),
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
+            if self.obs_inflight:
+                # INFLIGHT: 追加在飞指令 [a_{k-1}.steer, a_{k-1}.thr, a_{k-2}.steer, a_{k-2}.thr]
+                # _inflight[1]=最新 take_action(a_{k-1}),_inflight[0]=a_{k-2},最新在前
+                observation = np.concatenate([observation, self._inflight[1], self._inflight[0]])
+            self.last_obs = observation
+        else:
+            observation = self.image_array
+
         done = self.is_game_over()
+        if not done and self.no_progress_timeout > 0.0:
+            done = self._check_no_progress()
         reward = self.calc_reward(done)
 
         info = {
@@ -480,6 +651,12 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "car": (self.roll, self.pitch, self.yaw),
             "last_lap_time": self.last_lap_time,
             "lap_count": self.lap_count,
+            "collision_impulse": self.collision_impulse,
+            "flipped": self.flipped,
+            "stuck_time": self.stuck_time,
+            "lap": self.lap,
+            "frame_id": self.frame_id,
+            "state_obs": self.state_obs,
         }
 
         # Add the second image to the dict
@@ -489,6 +666,30 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # self.timer.on_frame()
 
         return observation, reward, done, info
+
+    def _check_no_progress(self) -> bool:
+        """奖励 v2:滑动窗(默认 10s)内遥测 pos 累计位移 < no_progress_dist(默认 1m)
+        即终止——杀停车漏洞(crash_penalty 只罚死不罚不动时,弱策略停车最优)。
+        窗内位移=相邻遥测 pos 欧氏距离分段累加,同步/异步通用。"""
+        now = time.time()
+        pos = (self.x, self.y, self.z)
+        if self._np_last_pos is not None:
+            import math as _m
+
+            self._np_window.append((now, _m.dist(pos, self._np_last_pos)))
+        self._np_last_pos = pos
+        self._np_window = [(t, s) for t, s in self._np_window if t >= now - self.no_progress_timeout]
+        if not self._np_window:
+            return False
+        span = now - self._np_window[0][0]
+        dist = sum(s for _, s in self._np_window)
+        # 窗满判定留 0.25s 容差:修剪用 t >= now-timeout,最老帧比 now-timeout 新
+        # 最多一个步长,span 永远差一步到不了 timeout(2026-10-20 探针实测定案)
+        if span >= self.no_progress_timeout - 0.25 and dist < self.no_progress_dist:
+            logger.debug(f"game over: no progress {dist:.2f}m in {span:.1f}s")
+            self.over = True
+            return True
+        return False
 
     def is_game_over(self) -> bool:
         return self.over
@@ -508,6 +709,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # max_speed = 10
 
         if done:
+            # 环境终止(非截断):conf 门控时统一扣 crash_penalty(默认 0=旧 -1)
+            if self.crash_penalty > 0.0:
+                return -self.crash_penalty
             return -1.0
 
         if self.cte > self.max_cte:
@@ -527,21 +731,18 @@ class DonkeyUnitySimHandler(IMesgHandler):
     # ------ Socket interface ----------- #
 
     def on_telemetry(self, message: Dict[str, Any]) -> None:
-        img_string = message["image"]
-        # cv2.imdecode 解码时释放 GIL(PIL 持锁),60fps 下不与 WebRTC 编码线程抢核;
-        # imdecode 输出 BGR,转 RGB 保持与 PIL 输出语义一致。
-        jpg = np.frombuffer(base64.b64decode(img_string), dtype=np.uint8)
+        # img_enc="none" 时模拟器省略 image 键，仅解码存在的图像。
+        if "image" in message:
+            self.image_array = _decode_jpeg_to_rgb(base64.b64decode(message["image"]))
 
-        # always update the image_array as the observation loop will hang if not changing.
-        self.image_array = cv2.cvtColor(cv2.imdecode(jpg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-        # Unlike time_received, this timestamp is never advanced by reset().
+        # 记录真实遥测到达时间；reset() 不得伪造该时间。
         self.last_telemetry_ts = time.time()
-        self.time_received = time.time()
+        self.time_received = self.last_telemetry_ts
+        self.steps_since_reset += 1
 
         if "image_b" in message:
             img_string_b = message["image_b"]
-            jpg_b = np.frombuffer(base64.b64decode(img_string_b), dtype=np.uint8)
-            self.image_array_b = cv2.cvtColor(cv2.imdecode(jpg_b, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            self.image_array_b = _decode_jpeg_to_rgb(base64.b64decode(img_string_b))
 
         if "pos_x" in message:
             self.x = message["pos_x"]
@@ -582,6 +783,22 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # It should be setup in the 4 scenes available now.
         if "cte" in message:
             self.cte = message["cte"]
+
+        # sdsandbox 新遥测字段(RL):始终存在,仍按存在性守卫兼容旧模拟器
+        if "collision_impulse" in message:
+            self.collision_impulse = message["collision_impulse"]
+        if "flipped" in message:
+            self.flipped = message["flipped"]
+        if "stuck_time" in message:
+            self.stuck_time = message["stuck_time"]
+        if "lap" in message:
+            self.lap = message["lap"]
+        if "frame_id" in message:
+            self.frame_id = message["frame_id"]
+        if "activeNode" in message:
+            self.active_node = message["activeNode"]
+        if "totalNodes" in message:
+            self.total_nodes = message["totalNodes"]
 
         if "lidar" in message:
             self.lidar = self.process_lidar_packet(message["lidar"])
@@ -626,13 +843,15 @@ class DonkeyUnitySimHandler(IMesgHandler):
         logger.debug("custom ep_over fn set.")
 
     def determine_episode_over(self):
-        # we have a few initial frames on start that are sometimes very large CTE when it's behind
-        # the path just slightly. We ignore those.
-        if math.fabs(self.cte) > 2 * self.max_cte:
-            pass
-        elif math.fabs(self.cte) > self.max_cte:
-            logger.debug(f"game over: cte {self.cte}")
-            self.over = True
+        # 出界判负:|cte|>max_cte 即终止(reset 后前 5 个 step 给宽限,只覆盖出生瞬间
+        # 的异常大 cte;宽限不保护"冲太远"——|cte| 极大同样终止,否则车冲出去后反而
+        # 永不判负,在野外空跑到截断)。
+        if math.fabs(self.cte) > self.max_cte:
+            if self.steps_since_reset < 5 and math.fabs(self.cte) > 2 * self.max_cte:
+                pass
+            else:
+                logger.debug(f"game over: off track cte {self.cte}")
+                self.over = True
         elif self.hit != "none":
             logger.debug(f"game over: hit {self.hit}")
             self.over = True
@@ -641,6 +860,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
             self.over = True
         elif self.dq:
             logger.debug("disqualified")
+            self.over = True
+
+        # sdsandbox RL 终止条件:翻车/卡死(遥测字段驱动,可经 conf 关闭)
+        if self.flipped and self.done_on_flip:
+            logger.debug("game over: flipped")
+            self.over = True
+        if self.stuck_time > self.stuck_time_thresh and self.done_on_stuck:
+            logger.debug("game over: stuck")
             self.over = True
 
         # Disable reset
@@ -687,8 +914,23 @@ class DonkeyUnitySimHandler(IMesgHandler):
         }
         self.queue_message(msg)
 
-    def send_reset_car(self) -> None:
+    def send_reset_car(self, seed: Optional[int] = None) -> None:
+        # sdsandbox 随机出生:spawn_cfg 带 reset_car 可选字段子集,seed 完全可复现。
+        # lateral_offset 带符号随机化(±均匀):固定单侧偏移会训出"只会向右回正"的
+        # 偏科策略,held-out 评测暴露横向恢复弱、全部以越界收场(2026-10-18 基线:
+        # 5 局 crash_rate 1.0,全为 |cte|≈2.6 越界)。seed 决定符号与幅度,可复现。
         msg = {"msg_type": "reset_car"}
+        if self.spawn_cfg:
+            for key, val in self.spawn_cfg.items():
+                msg[key] = val
+            lat = self.spawn_cfg.get("lateral_offset")
+            if lat and seed is not None:
+                import random as _rnd
+
+                rng = _rnd.Random((seed, "lat"))
+                msg["lateral_offset"] = round(rng.uniform(-lat, lat), 3)
+        if seed is not None:
+            msg["seed"] = seed
         self.queue_message(msg)
 
     def send_get_scene_names(self) -> None:
@@ -709,6 +951,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         body_rgb: Tuple[int, int, int] = (255, 255, 255),
         car_name: str = "car",
         font_size: int = 100,
+        ctl_step_ms: Optional[int] = None,
     ):
         """
         # body_style = "donkey" | "bare" | "car01" | "f1" | "cybertruck"
@@ -730,6 +973,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "car_name": car_name,
             "font_size": str(font_size),
         }
+        # 量化异步控制(相位协议):>0 时 sim 把控制应用与遥测对齐到物理网格边界,
+        # 动作-观测配对与同步步进 time_step=ctl_step 同构;None/0=旧行为。
+        if ctl_step_ms:
+            msg["ctl_step_ms"] = str(int(ctl_step_ms))
         self.blocking_send(msg)
         time.sleep(0.1)
 
@@ -765,7 +1012,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x: float = 0.0,
         rot_y: float = 0.0,
         rot_z: float = 0.0,
-        fps: int = 0,
+        fps: float = 0.0,
     ) -> None:
         """Camera config
         set any field to Zero to get the default camera setting.
@@ -793,8 +1040,8 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "rot_y": str(rot_y),
             "rot_z": str(rot_z),
         }
-        if fps:
-            # 仅显式请求时才发键:旧模拟器协议无此键,保持报文逐字节兼容
+        # 仅显式请求正帧率时发键，保持旧模拟器协议兼容。
+        if fps > 0:
             msg["fps"] = str(fps)
         self.blocking_send(msg)
         time.sleep(0.1)

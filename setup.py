@@ -46,6 +46,7 @@ setup(
             "pytest-xdist",
             # Type check
             "pytype",
+            "torch",
             # Lint code
             "ruff",
             # Sort imports
