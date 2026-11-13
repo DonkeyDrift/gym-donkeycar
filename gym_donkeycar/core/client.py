@@ -15,12 +15,16 @@ import logging
 import select
 import socket
 import time
-from threading import Thread
+from threading import Thread, current_thread
 from typing import Any, Dict
 
 from .util import replace_float_notation
 
 logger = logging.getLogger(__name__)
+
+# bounded select() wait so a dead or stalled peer can neither busy-spin the
+# reader loop nor block it forever; stop() also closes the socket to wake it.
+SELECT_TIMEOUT_SEC = 0.1
 
 
 class SDClient:
@@ -30,6 +34,7 @@ class SDClient:
         self.port = port
         self.poll_socket_sleep_sec = poll_socket_sleep_time
         self.th = None
+        self.do_process_msgs = False
 
         # the aborted flag will be set when we have detected a problem with the socket
         # that we can't recover from.
@@ -44,7 +49,13 @@ class SDClient:
         logger.info("connecting to %s:%d " % (self.host, self.port))
         try:
             self.s.connect((self.host, self.port))
+        except TimeoutError:
+            # never leak the socket on a connect timeout; re-raise as-is so
+            # callers can distinguish timeouts from other connect failures
+            self.s.close()
+            raise
         except ConnectionRefusedError:
+            self.s.close()
             raise (
                 Exception(
                     "Could not connect to server. Is it running? "
@@ -67,14 +78,33 @@ class SDClient:
     def on_msg_recv(self, j: Dict[str, Any]) -> None:
         logger.debug("got:" + j["msg_type"])
 
+    def is_connected(self) -> bool:
+        """Authoritative health signal: true only while the message loop is
+        running and the connection hasn't aborted or been stopped."""
+        return self.do_process_msgs and not self.aborted and self.th is not None and self.th.is_alive()
+
     def stop(self) -> None:
-        # signal proc_msg loop to stop, then wait for thread to finish
-        # close socket
+        # signal proc_msg loop to stop, then close the socket so a select/recv
+        # blocked on it wakes up and the fd doesn't linger. This is idempotent.
         self.do_process_msgs = False
-        if self.th is not None:
-            self.th.join()
         if self.s is not None:
-            self.s.close()
+            try:
+                self.s.close()
+            except OSError:
+                pass
+        # wait for the reader thread, but never join ourselves: stop() can be
+        # called from on_msg_recv inside the reader thread (on_abort path)
+        if self.th is not None and self.th is not current_thread():
+            self.th.join()
+
+    def _mark_aborted(self) -> None:
+        """Converge a dead socket (reset, orderly shutdown, recv error) to one
+        consistent state and notify the handler exactly once."""
+        if self.aborted:
+            return
+        self.aborted = True
+        self.do_process_msgs = False
+        self.on_msg_recv({"msg_type": "aborted"})
 
     def proc_msg(self, sock: socket.socket) -> None:  # noqa: C901
         """
@@ -95,15 +125,23 @@ class SDClient:
             time.sleep(self.poll_socket_sleep_sec)
             try:
                 # test our socket for readable, writable states.
-                readable, writable, exceptional = select.select(inputs, outputs, inputs)
+                readable, writable, exceptional = select.select(inputs, outputs, inputs, SELECT_TIMEOUT_SEC)
 
                 for s in readable:
                     try:
                         data = s.recv(1024 * 256)
-                    except ConnectionAbortedError:
-                        logger.warn("socket connection aborted")
+                    except (ConnectionAbortedError, ConnectionResetError):
+                        logger.warning("socket connection aborted")
                         print("socket connection aborted")
-                        self.do_process_msgs = False
+                        self._mark_aborted()
+                        break
+
+                    if not data:
+                        # orderly shutdown (FIN): recv would keep returning
+                        # empty forever, so converge instead of busy-spinning
+                        logger.warning("socket connection closed by peer")
+                        print("socket connection closed")
+                        self._mark_aborted()
                         break
 
                     # we don't technically need to convert from bytes to string
@@ -149,7 +187,10 @@ class SDClient:
                     logger.error("problems w sockets!")
 
             except Exception as e:
+                if self.aborted or not self.do_process_msgs:
+                    # already aborted, or stop() raced us: exit quietly so a
+                    # clean stop doesn't emit a spurious aborted notification
+                    break
                 print("Exception:", e)
-                self.aborted = True
-                self.on_msg_recv({"msg_type": "aborted"})
+                self._mark_aborted()
                 break

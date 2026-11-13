@@ -90,8 +90,22 @@ class DonkeyUnitySimContoller:
         self.handler.set_episode_over_fn(ep_over_fn)
 
     def wait_until_loaded(self) -> None:
+        timeout = getattr(self.handler, "observe_timeout", None)
+        deadline = time.time() + timeout if timeout else None
         time.sleep(0.1)
         while not self.handler.loaded:
+            client = self.client
+            if client is None or getattr(client, "aborted", False) or not getattr(client, "do_process_msgs", True):
+                # the sim connection died before the scene reported loaded;
+                # fail fast instead of waiting forever so callers (gym.make
+                # and reconnect logic) can tear down and retry
+                raise ConnectionError("sim connection lost while waiting for sim to load")
+            if deadline is not None and time.time() >= deadline:
+                # connection alive but the scene never reports loaded within
+                # observe_timeout: stop the client, then surface the timeout
+                # so callers (gym.make) fail fast and retry
+                client.stop()
+                raise TimeoutError(f"sim did not load within {timeout:.3f}s (observe_timeout)")
             logger.warning("waiting for sim to start..")
             time.sleep(1.0)
         logger.info("sim started!")
@@ -130,6 +144,14 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.SceneToLoad = conf["level"]
         self.loaded = False
         self.max_cte = conf["max_cte"]
+        # optional bound (seconds) on waiting for a fresh telemetry frame;
+        # absent or None keeps the legacy unbounded wait
+        observe_timeout = conf.get("observe_timeout")
+        if observe_timeout is not None:
+            observe_timeout = float(observe_timeout)
+            if not observe_timeout > 0 or observe_timeout == float("inf"):
+                raise ValueError("observe_timeout must be a positive finite number, got " f"{observe_timeout!r}")
+        self.observe_timeout = observe_timeout
         self.timer = FPSTimer()
 
         # sensor size - height, width, depth
@@ -139,6 +161,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.last_obs = self.image_array
         self.time_received = time.time()
         self.last_received = self.time_received
+        # timestamp of the last real telemetry frame; stays 0 until the sim
+        # actually sends one (reset must not fabricate it)
+        self.last_telemetry_ts = 0.0
         self.hit = "none"
         self.cte = 0.0
         self.x = 0.0
@@ -197,6 +222,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     def on_disconnect(self) -> None:
         logger.debug("socket disconnected")
+        self.client = None
+
+    def on_close(self) -> None:
+        logger.debug("socket closed")
         self.client = None
 
     def on_abort(self, message: Dict[str, Any]) -> None:
@@ -432,7 +461,19 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        deadline = time.time() + self.observe_timeout if self.observe_timeout else None
         while self.last_received == self.time_received:
+            client = self.client
+            if client is None or getattr(client, "aborted", False) or not getattr(client, "do_process_msgs", True):
+                # the sim connection died while we waited for telemetry; fail
+                # fast instead of spinning forever so callers (env.reset/step)
+                # can tear down and retry the connection
+                raise ConnectionError("sim connection lost while waiting for telemetry")
+            if deadline is not None and time.time() >= deadline:
+                # connection alive but silent: no telemetry within the
+                # configured observe_timeout; stop waiting and let callers
+                # tear down and retry instead of blocking forever
+                raise TimeoutError(f"no telemetry for {self.observe_timeout:.3f}s " "(observe_timeout reached on silent sim)")
             time.sleep(0.001)
 
         self.last_received = self.time_received
@@ -506,6 +547,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         # always update the image_array as the observation loop will hang if not changing.
         self.image_array = np.asarray(image)
         self.time_received = time.time()
+        self.last_telemetry_ts = self.time_received
 
         if "image_b" in message:
             img_string_b = message["image_b"]
