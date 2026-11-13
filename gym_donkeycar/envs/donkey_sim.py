@@ -13,6 +13,7 @@ import types
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Tuple, Union
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -90,24 +91,17 @@ class DonkeyUnitySimContoller:
         self.handler.set_episode_over_fn(ep_over_fn)
 
     def wait_until_loaded(self) -> None:
-        timeout = getattr(self.handler, "observe_timeout", None)
-        deadline = time.time() + timeout if timeout else None
-        time.sleep(0.1)
-        while not self.handler.loaded:
-            client = self.client
-            if client is None or getattr(client, "aborted", False) or not getattr(client, "do_process_msgs", True):
-                # the sim connection died before the scene reported loaded;
-                # fail fast instead of waiting forever so callers (gym.make
-                # and reconnect logic) can tear down and retry
-                raise ConnectionError("sim connection lost while waiting for sim to load")
-            if deadline is not None and time.time() >= deadline:
-                # connection alive but the scene never reports loaded within
-                # observe_timeout: stop the client, then surface the timeout
-                # so callers (gym.make) fail fast and retry
-                client.stop()
-                raise TimeoutError(f"sim did not load within {timeout:.3f}s (observe_timeout)")
-            logger.warning("waiting for sim to start..")
-            time.sleep(1.0)
+        deadline = time.monotonic() + self.handler.observe_timeout
+        try:
+            while not self.handler.loaded:
+                if not self.client.is_connected():
+                    raise ConnectionError("simulator disconnected while loading")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("simulator did not load before the timeout")
+                time.sleep(0.01)
+        except Exception:
+            self.client.stop()
+            raise
         logger.info("sim started!")
 
     def reset(self) -> None:
@@ -144,14 +138,6 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.SceneToLoad = conf["level"]
         self.loaded = False
         self.max_cte = conf["max_cte"]
-        # optional bound (seconds) on waiting for a fresh telemetry frame;
-        # absent or None keeps the legacy unbounded wait
-        observe_timeout = conf.get("observe_timeout")
-        if observe_timeout is not None:
-            observe_timeout = float(observe_timeout)
-            if not observe_timeout > 0 or observe_timeout == float("inf"):
-                raise ValueError("observe_timeout must be a positive finite number, got " f"{observe_timeout!r}")
-        self.observe_timeout = observe_timeout
         self.timer = FPSTimer()
 
         # sensor size - height, width, depth
@@ -161,9 +147,10 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.last_obs = self.image_array
         self.time_received = time.time()
         self.last_received = self.time_received
-        # timestamp of the last real telemetry frame; stays 0 until the sim
-        # actually sends one (reset must not fabricate it)
         self.last_telemetry_ts = 0.0
+        self.observe_timeout = float(conf.get("observe_timeout", 5.0))
+        if not math.isfinite(self.observe_timeout) or self.observe_timeout <= 0:
+            raise ValueError("observe_timeout must be finite and greater than zero")
         self.hit = "none"
         self.cte = 0.0
         self.x = 0.0
@@ -225,11 +212,13 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.client = None
 
     def on_close(self) -> None:
-        logger.debug("socket closed")
-        self.client = None
+        self.on_disconnect()
 
     def on_abort(self, message: Dict[str, Any]) -> None:
-        self.client.stop()
+        client = self.client
+        self.on_disconnect()
+        if client is not None:
+            client.stop()
 
     def on_need_car_config(self, message: Dict[str, Any]) -> None:
         logger.info("on need car config")
@@ -284,6 +273,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                     "rot_x",
                     "rot_y",
                     "rot_z",
+                    "fps",
                 ],
             )
             self.send_cam_config(**cam_config)
@@ -352,6 +342,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
                 "rot_x",
                 "rot_y",
                 "rot_z",
+                "fps",
             ],
         )
         if cam_config != {}:
@@ -461,21 +452,16 @@ class DonkeyUnitySimHandler(IMesgHandler):
         self.send_control(action[0], action[1])
 
     def observe(self) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        deadline = time.time() + self.observe_timeout if self.observe_timeout else None
+        deadline = time.monotonic() + self.observe_timeout
         while self.last_received == self.time_received:
-            client = self.client
-            if client is None or getattr(client, "aborted", False) or not getattr(client, "do_process_msgs", True):
-                # the sim connection died while we waited for telemetry; fail
-                # fast instead of spinning forever so callers (env.reset/step)
-                # can tear down and retry the connection
-                raise ConnectionError("sim connection lost while waiting for telemetry")
-            if deadline is not None and time.time() >= deadline:
-                # connection alive but silent: no telemetry within the
-                # configured observe_timeout; stop waiting and let callers
-                # tear down and retry instead of blocking forever
-                raise TimeoutError(f"no telemetry for {self.observe_timeout:.3f}s " "(observe_timeout reached on silent sim)")
+            if self.client is None or not self.client.is_connected():
+                raise ConnectionError("simulator disconnected while waiting for telemetry")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("no new simulator telemetry before the timeout")
             time.sleep(0.001)
 
+        if self.client is None or not self.client.is_connected():
+            raise ConnectionError("simulator disconnected before observation")
         self.last_received = self.time_received
         observation = self.image_array
         done = self.is_game_over()
@@ -542,17 +528,20 @@ class DonkeyUnitySimHandler(IMesgHandler):
 
     def on_telemetry(self, message: Dict[str, Any]) -> None:
         img_string = message["image"]
-        image = Image.open(BytesIO(base64.b64decode(img_string)))
+        # cv2.imdecode 解码时释放 GIL(PIL 持锁),60fps 下不与 WebRTC 编码线程抢核;
+        # imdecode 输出 BGR,转 RGB 保持与 PIL 输出语义一致。
+        jpg = np.frombuffer(base64.b64decode(img_string), dtype=np.uint8)
 
         # always update the image_array as the observation loop will hang if not changing.
-        self.image_array = np.asarray(image)
+        self.image_array = cv2.cvtColor(cv2.imdecode(jpg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        # Unlike time_received, this timestamp is never advanced by reset().
+        self.last_telemetry_ts = time.time()
         self.time_received = time.time()
-        self.last_telemetry_ts = self.time_received
 
         if "image_b" in message:
             img_string_b = message["image_b"]
-            image_b = Image.open(BytesIO(base64.b64decode(img_string_b)))
-            self.image_array_b = np.asarray(image_b)
+            jpg_b = np.frombuffer(base64.b64decode(img_string_b), dtype=np.uint8)
+            self.image_array_b = cv2.cvtColor(cv2.imdecode(jpg_b, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
         if "pos_x" in message:
             self.x = message["pos_x"]
@@ -776,6 +765,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x: float = 0.0,
         rot_y: float = 0.0,
         rot_z: float = 0.0,
+        fps: int = 0,
     ) -> None:
         """Camera config
         set any field to Zero to get the default camera setting.
@@ -785,6 +775,7 @@ class DonkeyUnitySimHandler(IMesgHandler):
         rot_x will rotate the camera
         with fish_eye_x/y == 0.0 then you get no distortion
         img_enc can be one of JPG|PNG|TGA
+        fps requests the telemetry push rate (DonkeyDrift sim patch; 0 = sim default 20)
         """
         msg = {
             "msg_type": msg_type,
@@ -802,6 +793,9 @@ class DonkeyUnitySimHandler(IMesgHandler):
             "rot_y": str(rot_y),
             "rot_z": str(rot_z),
         }
+        if fps:
+            # 仅显式请求时才发键:旧模拟器协议无此键,保持报文逐字节兼容
+            msg["fps"] = str(fps)
         self.blocking_send(msg)
         time.sleep(0.1)
 
