@@ -76,6 +76,94 @@ env.close()
 
 - see more examples: https://github.com/tawnkramer/gym-donkeycar/tree/master/examples
 
+## Managed Simulator Installation
+
+Instead of downloading the simulator from the
+[release page](https://github.com/tawnkramer/gym-donkeycar/releases) by hand,
+you can let `gym_donkeycar` manage the binary for you. The package ships the
+`donkey-sim-update` command line tool, which keeps an installation directory
+(`~/.donkeycar/simulators` by default) in sync with the upstream releases.
+
+### One-command update
+
+```shell
+donkey-sim-update update
+```
+
+This downloads the latest release asset for your platform (`DonkeySimMac.zip`,
+`DonkeySimLinux.zip` or `DonkeySimWin.zip`), verifies its SHA-256 checksum,
+stages it and applies it. Download progress is printed as a percentage.
+
+Other subcommands:
+
+```shell
+donkey-sim-update status            # installed/latest version and executable path
+donkey-sim-update check             # report whether a newer version is available
+donkey-sim-update update --dry-run  # show repo/current/latest/asset/size/target only
+donkey-sim-update use v25.10.06     # switch to an already installed version
+donkey-sim-update clean             # remove staging files and old versions
+donkey-sim-update launch            # start the managed simulator directly
+```
+
+### Using the managed simulator from the environment
+
+Pass `exe_path="managed"` in the environment configuration and the simulator
+is resolved from the managed installation:
+
+```python
+conf = {"exe_path": "managed", "port": 9091}
+env = gym.make("donkey-generated-track-v0", conf=conf)
+```
+
+### Check and auto modes
+
+`status` and `check` are read-only: they never modify installed or staged
+versions (at most they refresh the 24-hour release lookup cache).
+`update` runs in auto mode by default: download, verify and stage the new
+version and apply it immediately. If you pass `--pid` while a simulator is
+still running, the update is only staged until that process is gone.
+`update --version <version>` switches to an already installed version without
+downloading; only the latest release can be downloaded.
+
+### Applying after exit, and restarting
+
+To apply an update after a running simulator exits:
+
+```shell
+donkey-sim-update update --apply-after-exit --pid 12345
+```
+
+Add `--restart` to launch the newly installed version right after applying.
+`--host`, `--port` and `--headless` control how it is started:
+
+```shell
+donkey-sim-update update --apply-after-exit --pid 12345 --restart --headless
+```
+
+### Safety
+
+- Every download is checksum-verified (SHA-256) before it is staged; corrupt
+  or truncated downloads are discarded.
+- `use <version>` can switch back to a previously installed version.
+- With `--pid`, the update never replaces the binary while the simulator may
+  be running; with `--apply-after-exit` it waits for the process to exit
+  first.
+- `status` and `check` never change the installed or staged version.
+
+### Upstream repository
+
+The release source is configurable with `--repo`; `--root` changes the
+installation directory, and `--timeout` the network timeout. These options
+work before or after the subcommand:
+
+```shell
+donkey-sim-update --repo tawnkramer/gym-donkeycar --root ~/donkey-sim update
+donkey-sim-update update --root ~/donkey-sim --dry-run
+```
+
+Exit codes: `0` success, `2` invalid arguments or installation state,
+`3` network, download or verification failure.
+
 ## Action space
 
 A permissable action is a numpy array of length two with first steering
