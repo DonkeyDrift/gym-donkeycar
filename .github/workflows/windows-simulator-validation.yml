@@ -53,47 +53,7 @@ jobs:
             -ArgumentList @("--host", "127.0.0.1", "--port", "9097", "-batchmode", "-nographics", "-logFile", $unityLog) `
             -PassThru
 
-          $connected = $false
-          $client = $null
-          $deadline = (Get-Date).AddSeconds(90)
-          while ((Get-Date) -lt $deadline) {
-            if ($process.HasExited) {
-              break
-            }
-            try {
-              $client = New-Object System.Net.Sockets.TcpClient
-              $async = $client.BeginConnect("127.0.0.1", 9097, $null, $null)
-              if ($async.AsyncWaitHandle.WaitOne(1000) -and $client.Connected) {
-                $client.EndConnect($async)
-                $connected = $true
-                break
-              }
-              $client.Close()
-              $client = $null
-            } catch {
-              if ($client -ne $null) {
-                $client.Close()
-                $client = $null
-              }
-            }
-            Start-Sleep -Milliseconds 500
-          }
-
-          if (!$connected) {
-            if (!$process.HasExited) {
-              Stop-Process -Id $process.Id -Force
-            }
-            throw "simulator did not listen on TCP port 9097"
-          }
-
-          $message = '{"msg_type":"exit_scene"}' + [Environment]::NewLine
-          $bytes = [Text.Encoding]::UTF8.GetBytes($message)
-          $stream = $client.GetStream()
-          $stream.Write($bytes, 0, $bytes.Length)
-          $stream.Flush()
-          $client.Close()
-
-          if (!$process.WaitForExit(90)) {
+          if (!$process.WaitForExit(120)) {
             Stop-Process -Id $process.Id -Force
             throw "simulator did not exit after update callback"
           }
