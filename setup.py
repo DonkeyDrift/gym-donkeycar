@@ -63,6 +63,11 @@ setup(
             "sphinx-autodoc-typehints",
         ],
     },
+    entry_points={
+        "console_scripts": [
+            "donkey-sim-update = gym_donkeycar.simulator_update:main",
+        ],
+    },
     license="MIT license",
     long_description=readme + "\n\n" + history,
     include_package_data=True,

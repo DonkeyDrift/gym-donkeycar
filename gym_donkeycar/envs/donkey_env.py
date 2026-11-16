@@ -6,6 +6,7 @@ date: 2018-08-31
 
 import logging
 import os
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -45,6 +46,12 @@ def supply_defaults(conf: Dict[str, Any]) -> None:
         ("done_on_stuck", True),
         ("stuck_time_thresh", 2.5),
         ("sim_args", None),
+        # managed simulator updates (directory managed by the donkey-sim-update CLI)
+        ("sim_update_mode", "off"),
+        ("sim_update_repo", "tawnkramer/gym-donkeycar"),
+        ("sim_update_root", os.path.expanduser("~/.donkeycar/simulators")),
+        ("sim_update_cache_hours", 24),
+        ("sim_update_keep_versions", 2),
     ]
 
     if "exe_path" not in conf:
@@ -83,6 +90,9 @@ class DonkeyEnv(gym.Env):
         print("starting DonkeyGym env")
         self.viewer = None
         self.proc = None
+        self.updater = None
+        self.update_thread = None
+        self.update_staged = False
 
         # Validate render_mode
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
@@ -106,10 +116,14 @@ class DonkeyEnv(gym.Env):
         # start Unity simulation subprocess
         self.proc = None
         if "exe_path" in conf:
+            exe_path = conf["exe_path"]
+            if exe_path == "managed":
+                exe_path = self._prepare_managed_simulator(conf)
+                self._start_update_thread(conf)
             self.proc = DonkeyUnityProcess()
             # the unity sim server will bind to the host ip given
             self.proc.start(
-                conf["exe_path"],
+                exe_path,
                 host="0.0.0.0",
                 port=conf["port"],
                 headless=conf["headless"],
@@ -149,6 +163,108 @@ class DonkeyEnv(gym.Env):
         # wait until the car is loaded in the scene
         self.viewer.wait_until_loaded()
 
+    def _prepare_managed_simulator(self, conf: Dict[str, Any]) -> str:
+        """
+        Resolve the executable of a simulator managed by the updater
+        (exe_path == "managed").
+
+        Applies any staged update left over from a previous session first,
+        then resolves the installed executable. Never downloads implicitly:
+        if nothing is installed, raises RuntimeError pointing at the
+        donkey-sim-update CLI.
+        """
+        mode = conf["sim_update_mode"]
+        if mode not in ("off", "check", "auto"):
+            raise ValueError(f"Invalid sim_update_mode '{mode}'; expected one of 'off', 'check', 'auto'")
+
+        # Lazy import: core.simulator_updater may land in parallel with this
+        # integration, and normal/remote exe paths must not require it.
+        from gym_donkeycar.core.simulator_updater import SimulatorUpdater, resolve_managed_executable
+
+        self.updater = SimulatorUpdater(
+            repo=conf["sim_update_repo"],
+            root=conf["sim_update_root"],
+            cache_seconds=float(conf["sim_update_cache_hours"]) * 3600.0,
+        )
+        self.update_cache_hours = conf["sim_update_cache_hours"]
+        self.update_keep_versions = conf["sim_update_keep_versions"]
+
+        # apply a staged update left over from the previous session first;
+        # a broken staged payload must not prevent the simulator from starting
+        if self.updater.staged_path.exists():
+            self._apply_staged_and_clean()
+
+        exe_path = resolve_managed_executable(root=conf["sim_update_root"])
+        if exe_path is None:
+            raise RuntimeError(
+                f"No managed Donkey simulator installed under '{conf['sim_update_root']}'. "
+                "Run `donkey-sim-update update` to download and install it."
+            )
+        return exe_path
+
+    def _apply_staged_and_clean(self) -> None:
+        """Apply a staged update and prune old versions; never raises."""
+        try:
+            self.updater.apply_staged_update()
+        except Exception:
+            logger.warning("failed to apply staged simulator update", exc_info=True)
+            return
+        try:
+            self.updater.clean(keep_versions=self.update_keep_versions)
+        except Exception:
+            logger.warning("failed to clean up old simulator versions", exc_info=True)
+
+    def _start_update_thread(self, conf: Dict[str, Any]) -> None:
+        """Start the background check/stage worker for managed simulators."""
+        mode = conf["sim_update_mode"]
+        if mode == "check":
+            self.update_thread = threading.Thread(
+                target=self._check_update_worker, name="donkey-sim-update-check", daemon=True
+            )
+        elif mode == "auto":
+            self.update_thread = threading.Thread(
+                target=self._stage_update_worker, name="donkey-sim-update-stage", daemon=True
+            )
+        else:
+            return
+        self.update_thread.start()
+
+    def _check_update_worker(self) -> None:
+        try:
+            result = self.updater.check_for_update(force=self.update_cache_hours <= 0)
+        except Exception:
+            logger.warning("failed to check for simulator updates", exc_info=True)
+            return
+        latest = getattr(result, "latest", None)
+        if getattr(result, "update_available", False) and latest is not None:
+            logger.warning(
+                "A newer Donkey simulator release is available: %s. " "Run `donkey-sim-update update` to install it.",
+                getattr(latest, "tag", latest),
+            )
+
+    def _stage_update_worker(self) -> None:
+        try:
+            result = self.updater.check_for_update(force=self.update_cache_hours <= 0)
+            if not getattr(result, "update_available", False):
+                return
+            self.update_staged = bool(self.updater.stage_update(release=getattr(result, "latest", None)))
+        except Exception:
+            logger.warning("background simulator update staging failed", exc_info=True)
+            self.update_staged = False
+
+    def _finish_background_update(self) -> None:
+        """Apply a background-staged update if the worker already finished."""
+        thread = self.update_thread
+        if thread is None or self.updater is None:
+            return
+        if thread.is_alive():
+            # give a just-finished staging a moment to complete, but never
+            # block shutdown on a slow download
+            thread.join(timeout=0.5)
+        if not thread.is_alive() and self.update_staged:
+            self._apply_staged_and_clean()
+            self.update_staged = False
+
     def __del__(self) -> None:
         self.close()
 
@@ -157,6 +273,9 @@ class DonkeyEnv(gym.Env):
             self.viewer.quit()
         if hasattr(self, "proc") and self.proc is not None:
             self.proc.quit()
+        self._finish_background_update()
+        self.viewer = None
+        self.proc = None
 
     def set_reward_fn(self, reward_fn: Callable) -> None:
         self.viewer.set_reward_fn(reward_fn)

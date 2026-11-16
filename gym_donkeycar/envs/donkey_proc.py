@@ -6,16 +6,25 @@ date: 2018-09-12
 
 import os
 import subprocess
+from typing import Optional, Sequence
 
 
 class DonkeyUnityProcess:
     def __init__(self):
         self.proc1 = None
+        self.pid = None
 
     # ------ Launch Unity Env ----------- #
 
-    def start(self, sim_path: str, host: str = "0.0.0.0", port: int = 9091, headless: bool = False,
-              extra_args: list = None, keep_graphics: bool = False):
+    def start(
+        self,
+        sim_path: str,
+        host: str = "0.0.0.0",
+        port: int = 9091,
+        headless: bool = False,
+        extra_args: Optional[Sequence[str]] = None,
+        keep_graphics: bool = False,
+    ):
         if sim_path == "remote":
             return
 
@@ -38,14 +47,39 @@ class DonkeyUnityProcess:
 
         # Launch Unity environment
         self.proc1 = subprocess.Popen([sim_path] + port_args)
+        self.pid = self.proc1.pid
 
         print("donkey subprocess started")
 
-    def quit(self) -> None:
+    @property
+    def is_running(self) -> bool:
+        return self.proc1 is not None and self.proc1.poll() is None
+
+    def quit(self, timeout: float = 5.0) -> None:
         """
-        Shutdown unity environment
+        Shutdown unity environment.
+
+        Terminate gracefully first and wait up to `timeout` seconds; only
+        escalate to kill if the process does not exit in time. Calling quit
+        without a started process (or twice) is a no-op.
         """
-        if self.proc1 is not None:
-            print("closing donkey sim subprocess")
-            self.proc1.kill()
+        proc = self.proc1
+        if proc is None:
+            return
+
+        print("closing donkey sim subprocess")
+
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        finally:
             self.proc1 = None
+            self.pid = None
