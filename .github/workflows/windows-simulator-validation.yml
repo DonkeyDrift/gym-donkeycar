@@ -3,7 +3,7 @@ name: Windows simulator validation
 on:
   push:
     branches:
-      - Tony-windows-simulator-validation
+      - Tony-update-button-visibility
   workflow_dispatch:
 
 jobs:
@@ -18,34 +18,41 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          gh release download windows-simulator-validation `
+          gh release download windows-button-visibility `
             --repo DonkeyDrift/gym-donkeycar `
-            --pattern "DonkeySimWin-update-button-v25.10.06.zip" `
+            --pattern "DonkeySimWin-update-button-visibility-v25.10.06.zip" `
             --dir package
-          if ((Get-Item "package/DonkeySimWin-update-button-v25.10.06.zip").Length -eq 0) {
-            throw "downloaded package is empty"
+          $package = "package/DonkeySimWin-update-button-visibility-v25.10.06.zip"
+          if (!(Test-Path $package) -or (Get-Item $package).Length -eq 0) {
+            throw "downloaded package is missing or empty"
           }
 
       - name: Expand validation package
         shell: pwsh
         run: |
-          Expand-Archive -Path "package/DonkeySimWin-update-button-v25.10.06.zip" -DestinationPath expanded
+          Expand-Archive -Path "package/DonkeySimWin-update-button-visibility-v25.10.06.zip" -DestinationPath expanded
           $executable = Join-Path $PWD "expanded/DonkeySimWin/donkey_sim.exe"
           if (!(Test-Path $executable)) {
             throw "donkey_sim.exe was not found"
           }
 
-      - name: Run button callback validation
+      - name: Run update check and callback validation
         shell: pwsh
         run: |
           $root = Join-Path $PWD "expanded/DonkeySimWin"
           $executable = Join-Path $root "donkey_sim.exe"
           $updater = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-updater.cmd"
+          $checkLog = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-check.log"
           $updaterLog = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-updater.log"
           $unityLog = Join-Path $env:RUNNER_TEMP "donkey_sim.log"
           @'
           @echo off
-          echo called args: %* >> "%RUNNER_TEMP%\fake-donkey-sim-updater.log"
+          if "%~1"=="check" (
+            echo check args: %* >> "%RUNNER_TEMP%\fake-donkey-sim-check.log"
+            echo {"check_ok":true,"update_available":true,"installed":"v25.10.06","latest":"v25.11.01","source":"github"}
+            exit /b 0
+          )
+          echo update args: %* >> "%RUNNER_TEMP%\fake-donkey-sim-updater.log"
           exit /b 0
           '@ | Set-Content -Path $updater
 
@@ -61,13 +68,22 @@ jobs:
             throw "simulator did not exit after update callback"
           }
 
+          if (!(Test-Path $checkLog)) {
+            throw "fake updater check command was not called"
+          }
+          $checkArguments = Get-Content $checkLog -Raw
+          Write-Host "Fake updater check output: $checkArguments"
+          if (!$checkArguments.Contains("check --json")) {
+            throw "fake updater received incorrect check arguments"
+          }
+
           if (!(Test-Path $updaterLog)) {
-            throw "fake updater was not called"
+            throw "fake updater update command was not called"
           }
           $updaterArguments = Get-Content $updaterLog -Raw
-          Write-Host "Fake updater output: $updaterArguments"
+          Write-Host "Fake updater update output: $updaterArguments"
           if (!$updaterArguments.Contains("--apply-after-exit --pid") -or !$updaterArguments.Contains("--restart")) {
-            throw "fake updater received incorrect arguments"
+            throw "fake updater received incorrect update arguments"
           }
 
           if (Test-Path $unityLog) {
@@ -81,6 +97,7 @@ jobs:
         with:
           name: windows-simulator-validation-logs
           path: |
+            ${{ runner.temp }}/fake-donkey-sim-check.log
             ${{ runner.temp }}/fake-donkey-sim-updater.log
             ${{ runner.temp }}/donkey_sim.log
           if-no-files-found: warn
