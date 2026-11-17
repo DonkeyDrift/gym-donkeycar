@@ -1,6 +1,9 @@
 name: Windows simulator validation
 
 on:
+  push:
+    branches:
+      - Tony-windows-simulator-validation
   workflow_dispatch:
 
 jobs:
