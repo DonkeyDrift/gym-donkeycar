@@ -48,7 +48,7 @@ class SimClient(SDClient):
         self.msg_handler.on_recv_message(json_obj)
 
     def is_connected(self) -> bool:
-        return not self.aborted
+        return super().is_connected()
 
     def __del__(self) -> None:
         self.close()

@@ -16,7 +16,7 @@ with open("HISTORY.rst") as history_file:
     history = history_file.read()
 
 # Migrated from OpenAI gym to gymnasium
-requirements = ["gymnasium>=0.29.0", "numpy", "pillow"]
+requirements = ["gymnasium>=0.29.0", "numpy", "pillow", "opencv-python-headless"]
 
 
 setup(
@@ -46,6 +46,7 @@ setup(
             "pytest-xdist",
             # Type check
             "pytype",
+            "torch",
             # Lint code
             "ruff",
             # Sort imports

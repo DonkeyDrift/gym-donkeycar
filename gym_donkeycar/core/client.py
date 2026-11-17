@@ -48,10 +48,8 @@ class SDClient:
 
     def connect(self) -> None:
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # 大接收缓冲 + 禁 Nagle:遥测内嵌 JPEG 后每条约 60KB、60Hz 峰值 ~4MB/s,
-        # 默认接收缓冲(数百 KB)只够几条消息,消费侧一次 GIL 停顿就顶满管道、
-        # TCP 反压直接卡死模拟器的发送线程(实测把源帧率钉在 ~52Hz)。
-        # 8MB 缓冲可吸纳 1s+ 积压,只要消费侧平均跟得上,模拟器永不阻塞。
+        self.s.settimeout(5.0)
+        # 大接收缓冲 + 禁 Nagle，避免高频遥测因消费抖动反压模拟器发送线程。
         try:
             self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         except OSError:
@@ -66,12 +64,16 @@ class SDClient:
         try:
             self.s.connect((self.host, self.port))
         except ConnectionRefusedError:
+            self.s.close()
             raise (
                 Exception(
                     "Could not connect to server. Is it running? "
                     "If you specified 'remote', then you must start it manually."
                 )
             )
+        except OSError:
+            self.s.close()
+            raise
 
         # time.sleep(pause_on_create)
         self.do_process_msgs = True
@@ -89,27 +91,28 @@ class SDClient:
         logger.debug("got:" + j["msg_type"])
 
     def is_connected(self) -> bool:
-        """TCP 会话是否仍健康：未被 stop、未出错、读线程还活着。"""
-        if self.aborted or not self.do_process_msgs:
-            return False
-        return self.th is None or self.th.is_alive()
+        """TCP 会话仍健康，且接收线程正在运行。"""
+        return (
+            not self.aborted
+            and self.do_process_msgs
+            and self.s is not None
+            and self.s.fileno() != -1
+            and self.th is not None
+            and self.th.is_alive()
+        )
 
     def stop(self) -> None:
-        # 幂等且可重入：on_abort 会在读线程上下文里调用 stop()，此时不能
-        # join 当前线程（RuntimeError: cannot join current thread 曾让读线程
-        # 整个崩掉、socket 永不关闭、上层永远等不到恢复）。
+        # 幂等且可重入：on_abort 可能就在读线程里调用 stop()。
         self.do_process_msgs = False
-        sock = self.s
-        if sock is not None:
+        self.aborted = True
+        if self.s is not None:
             try:
-                # 先关 socket，解除读线程可能的阻塞
-                sock.close()
+                self.s.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        th = self.th
-        if th is not None and th is not current_thread():
-            # select 带超时（见 proc_msg），读线程至多 1s 内自行退出
-            th.join(timeout=2.0)
+            self.s.close()
+        if self.th is not None and self.th is not current_thread():
+            self.th.join(timeout=2.0)
 
     def proc_msg(self, sock: socket.socket) -> None:  # noqa: C901
         """
@@ -119,7 +122,11 @@ class SDClient:
         And we will read any messages when it's in a readable state and then
         call self.on_msg_recv with the json object message.
         """
-        sock.setblocking(False)
+        try:
+            sock.setblocking(False)
+        except OSError:
+            self.stop()
+            return
         inputs = [sock]
         outputs = [sock]
         localbuffer = ""
@@ -131,22 +138,14 @@ class SDClient:
             t0 = time.perf_counter()
             try:
                 # test our socket for readable, writable states.
-                # 带超时：stop() 关闭 socket 后读线程至多 1s 内自行退出，
-                # 不让外部 join 无限等待。
-                readable, writable, exceptional = select.select(
-                    inputs, outputs, inputs, 1.0)
+                readable, writable, exceptional = select.select(inputs, outputs, inputs, 0.1)
                 t1 = time.perf_counter()
                 _t("recv_wait", t1 - t0)
 
                 for s in readable:
                     try:
                         data = s.recv(1024 * 256)
-                    except (ConnectionAbortedError, ConnectionResetError,
-                            BrokenPipeError, OSError) as e:
-                        # 对端复位/本地 socket 关闭等：标记失联后退出读线程。
-                        # 必须发 aborted 通知：on_abort 会调 stop() 关闭 socket
-                        # （FD 不残留），上层也能立刻感知失联；此前只置标志就
-                        # break，socket 悬挂、handler 永远等不到失联信号。
+                    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError) as e:
                         logger.warning("socket recv failed: %s", e)
                         self.aborted = True
                         self.do_process_msgs = False
@@ -157,9 +156,7 @@ class SDClient:
                         return
 
                     if not data:
-                        # 对端正常关闭（FIN）：与 RST 同样收敛为失联。
-                        # 不处理的话 select 立刻返回 readable、recv 返回空，
-                        # 读线程 100% CPU 空转到天荒地老。
+                        # FIN 也必须收敛，否则 select/recv 会持续空转。
                         logger.warning("socket closed by peer (EOF)")
                         self.aborted = True
                         self.do_process_msgs = False
@@ -185,6 +182,8 @@ class SDClient:
                         localbuffer = localbuffer[n1:]
 
                         for m in msgs:
+                            if not self.do_process_msgs:
+                                break
                             if len(m) <= 2:
                                 continue
                             # Replace comma with dots for floats
@@ -215,20 +214,16 @@ class SDClient:
                         self.msg = None
 
                 if len(exceptional) > 0:
-                    logger.error("problems w sockets!")
+                    raise ConnectionError("simulator socket exception")
 
             except Exception as e:
-                # stop() 已在别处关 socket（on_abort→stop 重入）时，select/
-                # sendall 会对 -1 FD 报错——纯拆卸噪声，静默退出即可，
-                # 不再置 aborted、不再二次通知
-                if not self.do_process_msgs:
-                    return
-                print("Exception:", e)
-                self.aborted = True
-                self.do_process_msgs = False
-                # on_abort 内部会调用 stop()（重入安全），随后退出读线程
-                try:
-                    self.on_msg_recv({"msg_type": "aborted"})
-                except Exception:
-                    logger.exception("on_abort 通知失败")
+                if self.do_process_msgs:
+                    logger.warning("simulator connection lost: %s", e)
+                    self.aborted = True
+                    self.do_process_msgs = False
+                    try:
+                        self.on_msg_recv({"msg_type": "aborted"})
+                    except Exception:
+                        logger.exception("simulator disconnect callback failed")
+                self.stop()
                 break
