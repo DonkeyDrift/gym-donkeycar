@@ -3,6 +3,7 @@
 
 """Tests for the `donkey-sim-update` command line interface."""
 
+import json
 import os
 import sys
 import types
@@ -73,7 +74,7 @@ class FakeUpdater:
 class NoUpdateFakeUpdater(FakeUpdater):
     def check_for_update(self, force=False):
         self.calls.append(("check_for_update",))
-        return False
+        return SimpleNamespace(update_available=False, latest=SimpleNamespace(tag="25.10.06"))
 
 
 class UpdateCheckFakeUpdater(FakeUpdater):
@@ -178,6 +179,42 @@ def test_check_reports_versions_from_update_check(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "Update available: 25.10.06 -> 25.11.01" in out
+
+
+def test_check_json_reports_update_available(fake_updater, capsys):
+    rc = simulator_update.main(["check", "--json"])
+    assert rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "check_ok": True,
+        "update_available": True,
+        "installed": "25.10.06",
+        "latest": "25.11.01",
+        "source": "github",
+    }
+    assert ("check_for_update",) in FakeUpdater.instances[-1].calls
+
+
+def test_check_json_reports_up_to_date(monkeypatch, capsys):
+    monkeypatch.setattr(simulator_update, "SimulatorUpdater", NoUpdateFakeUpdater)
+    rc = simulator_update.main(["check", "--json"])
+    assert rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["check_ok"] is True
+    assert result["update_available"] is False
+    assert result["installed"] == "25.10.06"
+    assert result["latest"] == "25.10.06"
+    assert result["source"] == "github"
+
+
+def test_check_json_reports_failure(monkeypatch, capsys):
+    monkeypatch.setattr(simulator_update, "SimulatorUpdater", FailingCheckUpdater)
+    rc = simulator_update.main(["check", "--json"])
+    assert rc == 3
+    result = json.loads(capsys.readouterr().out)
+    assert result["check_ok"] is False
+    assert result["update_available"] is False
+    assert "connection refused" in result["error"]
 
 
 def test_check_network_failure_exits_3(fake_updater, monkeypatch, capsys):

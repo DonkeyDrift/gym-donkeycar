@@ -13,6 +13,7 @@ Exit codes:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -195,10 +196,16 @@ def _cmd_check(args) -> int:
     try:
         installed = _installed_version(updater)
     except Exception as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"check_ok": False, "update_available": False, "error": str(exc)}, separators=(",", ":")))
+            return 3
         return _error(args, "failed to read the installed version: {}.".format(exc))
     try:
         result = updater.check_for_update()
     except Exception as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"check_ok": False, "update_available": False, "error": str(exc)}, separators=(",", ":")))
+            return 3
         return _error(args, "failed to check for updates: {}.".format(exc), 3)
     available = False
     latest = None
@@ -210,6 +217,20 @@ def _cmd_check(args) -> int:
     else:
         available = bool(getattr(result, "update_available", False))
         latest = _field(getattr(result, "latest", None), "tag", "version", "tag_name")
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "check_ok": True,
+                    "update_available": bool(available),
+                    "installed": installed,
+                    "latest": latest,
+                    "source": "github",
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
     print("installed: {}".format(installed or "none"))
     if latest:
         print("latest:           {}".format(latest))
@@ -404,6 +425,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="check whether a newer version is available")
     _add_common_arguments(check, include_defaults=False)
+    check.add_argument("--json", action="store_true", help="write a machine-readable JSON result to stdout")
     check.set_defaults(handler=_cmd_check)
 
     update = sub.add_parser("update", aliases=["install"], help="download, verify, stage and apply an update")
