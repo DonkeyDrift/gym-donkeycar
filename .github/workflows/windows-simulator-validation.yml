@@ -56,7 +56,7 @@ jobs:
             -ArgumentList @("--host", "127.0.0.1", "--port", "9097", "-batchmode", "-nographics", "-logFile", $unityLog) `
             -PassThru
 
-          if (!$process.WaitForExit(120)) {
+          if (!$process.WaitForExit(120000)) {
             Stop-Process -Id $process.Id -Force
             throw "simulator did not exit after update callback"
           }
