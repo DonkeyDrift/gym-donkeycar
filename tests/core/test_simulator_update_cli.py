@@ -28,13 +28,14 @@ import gym_donkeycar.simulator_update as simulator_update
 class FakeUpdater:
     instances = []
 
-    def __init__(self, repo=None, root=None, platform=None, timeout=None, progress=None):
+    def __init__(self, repo=None, root=None, platform=None, timeout=None, progress=None, prerelease=None):
         FakeUpdater.instances.append(self)
         self.repo = repo
         self.root = root
         self.platform = platform
         self.timeout = timeout
         self.progress = progress
+        self.prerelease = prerelease
         self.installed = "25.10.06"
         self.latest_info = SimpleNamespace(tag="25.11.01", asset_name="DonkeySimMac.zip", asset_size=123456789)
         self.calls = []
@@ -190,9 +191,18 @@ def test_check_json_reports_update_available(fake_updater, capsys):
         "update_available": True,
         "installed": "25.10.06",
         "latest": "25.11.01",
+        "channel": "stable",
         "source": "github",
     }
     assert ("check_for_update",) in FakeUpdater.instances[-1].calls
+
+
+def test_check_json_prerelease_channel_is_reported(fake_updater, capsys):
+    rc = simulator_update.main(["check", "--json", "--prerelease"])
+    assert rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["channel"] == "prerelease"
+    assert FakeUpdater.instances[-1].prerelease is True
 
 
 def test_check_json_reports_up_to_date(monkeypatch, capsys):
@@ -449,6 +459,15 @@ def test_global_options_are_forwarded_to_updater(fake_updater, tmp_path):
     assert updater.timeout == 12.5
     assert updater.platform in ("darwin", "linux", "win32")
     assert callable(updater.progress)
+    assert updater.prerelease is False
+
+
+def test_prerelease_option_is_forwarded_to_updater(fake_updater, tmp_path):
+    root = str(tmp_path / "sim-root-pre")
+    rc = simulator_update.main(["status", "--repo", "someone/donkey-fork", "--root", root, "--prerelease"])
+    assert rc == 0
+    updater = FakeUpdater.instances[-1]
+    assert updater.prerelease is True
 
 
 def test_global_options_before_subcommand_are_forwarded_to_updater(fake_updater, tmp_path):

@@ -294,6 +294,53 @@ def test_fetch_latest_parses_release_and_selects_platform_asset(tmp_path, monkey
     assert json.loads((tmp_path / "last_check.json").read_text())["release"]["tag"] == "v25.10.06"
 
 
+def test_fetch_latest_prerelease_uses_releases_list(tmp_path, monkeypatch):
+    stable = github_release_payload(tag="v25.10.06")
+    pre = github_release_payload(tag="v25.11.50")
+    pre["prerelease"] = True
+    calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps([stable, pre]).encode()))
+
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin", prerelease=True)
+    release = updater.fetch_latest()
+
+    assert release.tag == "v25.11.50"
+    assert calls[0][0].full_url == "https://api.github.com/repos/DonkeyDrift/gym-donkeycar/releases?per_page=30"
+    assert json.loads((tmp_path / "last_check.json").read_text())["channel"] == "prerelease"
+
+
+def test_fetch_latest_prerelease_without_any_raises(tmp_path, monkeypatch):
+    stable = github_release_payload(tag="v25.10.06")
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps([stable]).encode()))
+
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin", prerelease=True)
+    with pytest.raises(su.SimulatorUpdateError, match="no pre-release"):
+        updater.fetch_latest()
+
+
+def test_fetch_latest_cache_is_channel_isolated(tmp_path, monkeypatch):
+    payload = github_release_payload()
+
+    def handler(request, timeout):
+        if request.full_url.endswith("/releases?per_page=30"):
+            return FakeResponse(json.dumps([payload]).encode())
+        return FakeResponse(json.dumps(payload).encode())
+
+    calls = install_urlopen(monkeypatch, handler)
+
+    stable_updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+    assert stable_updater.fetch_latest().tag == "v25.10.06"
+    assert len(calls) == 1
+
+    stable_again = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+    assert stable_again.fetch_latest().tag == "v25.10.06"
+    assert len(calls) == 1  # stable cache hit
+
+    pre_updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin", prerelease=True)
+    with pytest.raises(su.SimulatorUpdateError, match="no pre-release"):
+        pre_updater.fetch_latest()
+    assert len(calls) == 2  # prerelease misses the stable cache and hits the API
+
+
 def test_fetch_latest_caches_within_24_hours(tmp_path, monkeypatch):
     payload = github_release_payload()
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
