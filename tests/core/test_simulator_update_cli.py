@@ -16,7 +16,7 @@ import pytest
 # each test monkeypatches the CLI's bindings with fakes, so nothing touches
 # the network or any path outside tmp_path.
 _core_updater_stub = types.ModuleType("gym_donkeycar.core.simulator_updater")
-_core_updater_stub.DEFAULT_SIMULATOR_UPDATE_REPO = "tawnkramer/gym-donkeycar"
+_core_updater_stub.DEFAULT_SIMULATOR_UPDATE_REPO = "DonkeyDrift/gym-donkeycar"
 _core_updater_stub.SimulatorUpdater = object
 _core_updater_stub.resolve_managed_executable = None
 _core_updater_stub.wait_for_pid = None

@@ -52,12 +52,12 @@ else:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SIMULATOR_UPDATE_REPO = "tawnkramer/gym-donkeycar"
+DEFAULT_SIMULATOR_UPDATE_REPO = "DonkeyDrift/gym-donkeycar"
 
 _DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CHUNK_SIZE = 64 * 1024
 _API_LATEST_URL = "https://api.github.com/repos/{repo}/releases/latest"
-_USER_AGENT = "gym-donkeycar-simulator-updater/1.0 (+https://github.com/tawnkramer/gym-donkeycar)"
+_USER_AGENT = "gym-donkeycar-simulator-updater/1.0 (+https://github.com/DonkeyDrift/gym-donkeycar)"
 _VERSION_METADATA_NAME = "version.json"
 
 _PLATFORM_ASSET_NAMES = {

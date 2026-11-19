@@ -235,7 +235,7 @@ def spawn_sleeper(seconds):
 
 
 def test_default_repo_constant():
-    assert su.DEFAULT_SIMULATOR_UPDATE_REPO == "tawnkramer/gym-donkeycar"
+    assert su.DEFAULT_SIMULATOR_UPDATE_REPO == "DonkeyDrift/gym-donkeycar"
 
 
 def test_default_root_is_home_donkeycar_simulators():
@@ -286,10 +286,10 @@ def test_fetch_latest_parses_release_and_selects_platform_asset(tmp_path, monkey
     assert release.asset_size == 123
     assert release.asset_sha256 == "sha256:" + DIGEST_HEX
     assert release.published_at == "2025-10-06T00:00:00Z"
-    assert calls[0][0].full_url == "https://api.github.com/repos/tawnkramer/gym-donkeycar/releases/latest"
+    assert calls[0][0].full_url == "https://api.github.com/repos/DonkeyDrift/gym-donkeycar/releases/latest"
     assert (
         calls[0][0].get_header("User-agent")
-        == "gym-donkeycar-simulator-updater/1.0 (+https://github.com/tawnkramer/gym-donkeycar)"
+        == "gym-donkeycar-simulator-updater/1.0 (+https://github.com/DonkeyDrift/gym-donkeycar)"
     )
     assert json.loads((tmp_path / "last_check.json").read_text())["release"]["tag"] == "v25.10.06"
 

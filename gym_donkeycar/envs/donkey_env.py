@@ -48,7 +48,7 @@ def supply_defaults(conf: Dict[str, Any]) -> None:
         ("sim_args", None),
         # managed simulator updates (directory managed by the donkey-sim-update CLI)
         ("sim_update_mode", "off"),
-        ("sim_update_repo", "tawnkramer/gym-donkeycar"),
+        ("sim_update_repo", "DonkeyDrift/gym-donkeycar"),
         ("sim_update_root", os.path.expanduser("~/.donkeycar/simulators")),
         ("sim_update_cache_hours", 24),
         ("sim_update_keep_versions", 2),
