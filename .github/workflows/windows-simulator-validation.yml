@@ -18,11 +18,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          gh release download v1.4.0 `
+          gh release download windows-simulator-validation `
             --repo DonkeyDrift/gym-donkeycar `
-            --pattern "DonkeySimWin.zip" `
+            --pattern "DonkeySimWin-update-button-v25.10.06.zip" `
             --dir package
-          $package = "package/DonkeySimWin.zip"
+          $package = "package/DonkeySimWin-update-button-v25.10.06.zip"
           if (!(Test-Path $package) -or (Get-Item $package).Length -eq 0) {
             throw "downloaded package is missing or empty"
           }
@@ -30,7 +30,7 @@ jobs:
       - name: Expand validation package
         shell: pwsh
         run: |
-          Expand-Archive -Path "package/DonkeySimWin.zip" -DestinationPath expanded
+          Expand-Archive -Path "package/DonkeySimWin-update-button-v25.10.06.zip" -DestinationPath expanded
           $executable = Join-Path $PWD "expanded/DonkeySimWin/donkey_sim.exe"
           if (!(Test-Path $executable)) {
             throw "donkey_sim.exe was not found"
