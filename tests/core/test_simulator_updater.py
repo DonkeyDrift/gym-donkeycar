@@ -75,6 +75,11 @@ def github_release_payload(
     return {"tag_name": tag, "published_at": "2025-10-06T00:00:00Z", "assets": [asset]}
 
 
+def github_releases_list(*entries):
+    """Payload of the /releases list endpoint (newest first)."""
+    return list(entries)
+
+
 def mac_zip_bytes(entry="DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim", content=b"#!/bin/sh\nexit 0\n"):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -274,7 +279,7 @@ def test_invalid_repo_raises(tmp_path):
 
 
 def test_fetch_latest_parses_release_and_selects_platform_asset(tmp_path, monkeypatch):
-    payload = github_release_payload(size=123, digest="sha256:" + DIGEST_HEX)
+    payload = github_releases_list(github_release_payload(size=123, digest="sha256:" + DIGEST_HEX))
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
 
     updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
@@ -286,7 +291,7 @@ def test_fetch_latest_parses_release_and_selects_platform_asset(tmp_path, monkey
     assert release.asset_size == 123
     assert release.asset_sha256 == "sha256:" + DIGEST_HEX
     assert release.published_at == "2025-10-06T00:00:00Z"
-    assert calls[0][0].full_url == "https://api.github.com/repos/tawnkramer/gym-donkeycar/releases/latest"
+    assert calls[0][0].full_url == "https://api.github.com/repos/tawnkramer/gym-donkeycar/releases?per_page=10"
     assert (
         calls[0][0].get_header("User-agent")
         == "gym-donkeycar-simulator-updater/1.0 (+https://github.com/tawnkramer/gym-donkeycar)"
@@ -295,7 +300,7 @@ def test_fetch_latest_parses_release_and_selects_platform_asset(tmp_path, monkey
 
 
 def test_fetch_latest_caches_within_24_hours(tmp_path, monkeypatch):
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path))
 
@@ -307,7 +312,7 @@ def test_fetch_latest_caches_within_24_hours(tmp_path, monkeypatch):
 
 
 def test_fetch_latest_force_bypasses_cache(tmp_path, monkeypatch):
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path))
 
@@ -318,7 +323,7 @@ def test_fetch_latest_force_bypasses_cache(tmp_path, monkeypatch):
 
 
 def test_fetch_latest_honors_custom_cache_ttl(tmp_path, monkeypatch):
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path), cache_seconds=3600)
     cache_path = tmp_path / "last_check.json"
@@ -356,7 +361,7 @@ def test_fetch_latest_stale_cache_refetches(tmp_path, monkeypatch):
             }
         )
     )
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path))
 
@@ -367,7 +372,7 @@ def test_fetch_latest_stale_cache_refetches(tmp_path, monkeypatch):
 def test_fetch_latest_corrupted_cache_refetches(tmp_path, monkeypatch):
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "last_check.json").write_text("{not json")
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     calls = install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path))
 
@@ -422,12 +427,53 @@ def test_fetch_latest_invalid_json_raises(tmp_path, monkeypatch):
 
 
 def test_fetch_latest_missing_platform_asset_raises(tmp_path, monkeypatch):
-    payload = {"tag_name": "v25.10.06", "assets": [{"name": "DonkeySimWin.zip", "browser_download_url": "https://x.invalid"}]}
+    payload = [{"tag_name": "v25.10.06", "assets": [{"name": "DonkeySimWin.zip", "browser_download_url": "https://x.invalid"}]}]
     install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
     with pytest.raises(su.SimulatorUpdateError, match="DonkeySimMac.zip"):
         updater.fetch_latest()
 
+
+
+
+def test_fetch_latest_selects_prerelease_and_skips_drafts_and_asset_mismatches(tmp_path, monkeypatch):
+    other_platform = github_release_payload(tag="v9.9.9", asset_name="DonkeySimPS5.zip")
+    other_platform["prerelease"] = True
+    draft = github_release_payload(tag="v8.8.8")
+    draft["draft"] = True
+    prerelease = github_release_payload(tag="v1.4.1")
+    prerelease["prerelease"] = True
+    payload = github_releases_list(other_platform, draft, prerelease)
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
+
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+    release = updater.fetch_latest()
+
+    assert release.tag == "v1.4.1"
+    assert release.asset_name == "DonkeySimMac.zip"
+
+
+def test_fetch_latest_picks_highest_semver_not_list_order(tmp_path, monkeypatch):
+    # 回归：v1.4.1 由三天前的草稿发布而来，created_at 早于 v1.4.0，
+    # API 列表按 created_at 排序把它压在下面——必须按语义化版本择优。
+    older_creation_newer_tag = github_release_payload(tag="v1.4.1")
+    newer_creation_older_tag = github_release_payload(tag="v1.4.0")
+    payload = github_releases_list(newer_creation_older_tag, older_creation_newer_tag)
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
+
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+    release = updater.fetch_latest()
+
+    assert release.tag == "v1.4.1"
+
+
+def test_fetch_latest_raises_when_no_release_carries_platform_asset(tmp_path, monkeypatch):
+    payload = github_releases_list(github_release_payload(asset_name="DonkeySimPS5.zip"))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
+
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+    with pytest.raises(su.SimulatorUpdateError, match="no release with a 'DonkeySimMac.zip' asset"):
+        updater.fetch_latest()
 
 # ---------------------------------------------------------------------------
 # get_installed / check_for_update
@@ -465,7 +511,7 @@ def test_get_installed_none_when_executable_missing(tmp_path):
 
 
 def test_check_for_update_nothing_installed(tmp_path, monkeypatch):
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     updater = su.SimulatorUpdater(root=str(tmp_path))
 
@@ -478,7 +524,7 @@ def test_check_for_update_nothing_installed(tmp_path, monkeypatch):
 
 
 def test_check_for_update_same_tag_not_available(tmp_path, monkeypatch):
-    payload = github_release_payload()
+    payload = github_releases_list(github_release_payload())
     install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     root = tmp_path
     version_dir, executable = make_installed_version(root, "v25.10.06")
@@ -491,7 +537,7 @@ def test_check_for_update_same_tag_not_available(tmp_path, monkeypatch):
 
 
 def test_check_for_update_newer_tag_available(tmp_path, monkeypatch):
-    payload = github_release_payload(tag="v26.0.0")
+    payload = github_releases_list(github_release_payload(tag="v26.0.0"))
     install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(json.dumps(payload).encode()))
     root = tmp_path
     version_dir, executable = make_installed_version(root, "v25.10.06")
@@ -925,7 +971,7 @@ def test_atomic_writes_leave_no_temp_files(tmp_path, monkeypatch):
 
 def test_install_update_end_to_end(tmp_path, monkeypatch):
     payload = mac_zip_bytes()
-    release_payload = github_release_payload(size=len(payload), digest=digest_of(payload))
+    release_payload = github_releases_list(github_release_payload(size=len(payload), digest=digest_of(payload)))
     calls = install_urlopen(
         monkeypatch,
         lambda request, timeout: (

@@ -56,9 +56,15 @@ DEFAULT_SIMULATOR_UPDATE_REPO = "tawnkramer/gym-donkeycar"
 
 _DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CHUNK_SIZE = 64 * 1024
-_API_LATEST_URL = "https://api.github.com/repos/{repo}/releases/latest"
+# /releases (list endpoint) rather than /releases/latest: the single "latest"
+# endpoint EXCLUDES pre-releases, and the publishing channel marks every
+# Tony-branch simulator build as a pre-release — /releases/latest would hide
+# them entirely (verified 2026-11-20: it 404s on a repo whose only release
+# is a pre-release). The list returns newest-first and excludes drafts.
+_API_RELEASES_URL = "https://api.github.com/repos/{repo}/releases?per_page=10"
 _USER_AGENT = "gym-donkeycar-simulator-updater/1.0 (+https://github.com/tawnkramer/gym-donkeycar)"
 _VERSION_METADATA_NAME = "version.json"
+_TAG_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 _PLATFORM_ASSET_NAMES = {
     "darwin": "DonkeySimMac.zip",
@@ -127,6 +133,23 @@ def _silent_unlink(path: Path) -> None:
         os.unlink(str(path))
     except OSError:
         pass
+
+
+def _tag_sort_key(entry: Any) -> tuple:
+    """Comparable key for a release entry's tag: semantic triple when parseable."""
+    tag = entry.get("tag_name") if isinstance(entry, dict) else None
+    if not isinstance(tag, str):
+        return (-1, (0, 0, 0), "")
+    match = _TAG_VERSION_RE.match(tag.strip())
+    if match is None:
+        return (0, (0, 0, 0), tag)
+    parts = []
+    for part in match.groups():
+        try:
+            parts.append(int(part))
+        except (TypeError, ValueError):
+            parts.append(0)
+    return (1, tuple(parts), tag)
 
 
 def sanitize_tag(tag: Any) -> str:
@@ -476,7 +499,7 @@ class SimulatorUpdater:
         if not isinstance(self.repo, str) or "/" not in self.repo:
             raise SimulatorUpdateError("invalid GitHub repository: %r" % (self.repo,))
         self._asset_name()  # fail fast on unsupported platforms, before any network call
-        url = _API_LATEST_URL.format(repo=self.repo)
+        url = _API_RELEASES_URL.format(repo=self.repo)
         request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -503,7 +526,26 @@ class SimulatorUpdater:
             data = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             raise SimulatorUpdateError("GitHub API returned invalid JSON for %s: %s" % (url, exc)) from exc
-        release = self._release_from_api(data)
+        if not isinstance(data, list):
+            raise SimulatorUpdateError("unexpected GitHub API response format")
+        asset_name = self._asset_name()
+        candidates = []
+        for entry in data:
+            if not isinstance(entry, dict) or entry.get("draft"):
+                continue
+            assets = entry.get("assets") or []
+            if any(isinstance(asset, dict) and asset.get("name") == asset_name for asset in assets):
+                candidates.append(entry)
+        # Pick by highest semantic tag, not by list order: the API sorts by
+        # created_at, and a release published from a long-standing draft
+        # carries an old created_at and can sort below an older tag
+        # (observed live 2026-11-20 with v1.4.0 above v1.4.1).
+        candidates.sort(key=_tag_sort_key, reverse=True)
+        release = self._release_from_api(candidates[0]) if candidates else None
+        if release is None:
+            raise SimulatorUpdateError(
+                "no release with a %r asset for platform %r in %s" % (asset_name, self.platform, self.repo)
+            )
         self._write_cache(release)
         return release
 
