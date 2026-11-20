@@ -18,7 +18,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          gh release download v1.4.2 `
+          gh release download v1.4.3 `
             --repo DonkeyDrift/gym-donkeycar `
             --pattern "DonkeySimWin.zip" `
             --dir package
