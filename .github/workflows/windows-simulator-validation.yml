@@ -18,7 +18,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
-          gh release download v1.4.0 `
+          gh release download v1.4.2 `
             --repo DonkeyDrift/gym-donkeycar `
             --pattern "DonkeySimWin.zip" `
             --dir package
@@ -31,16 +31,16 @@ jobs:
         shell: pwsh
         run: |
           Expand-Archive -Path "package/DonkeySimWin.zip" -DestinationPath expanded
-          $executable = Join-Path $PWD "expanded/DonkeySimWin/donkey_sim.exe"
+          $executable = Join-Path $PWD "expanded/DonkeySimWin/Donkey Sim.exe"
           if (!(Test-Path $executable)) {
-            throw "donkey_sim.exe was not found"
+            throw "Donkey Sim.exe was not found"
           }
 
       - name: Run update check and callback validation
         shell: pwsh
         run: |
           $root = Join-Path $PWD "expanded/DonkeySimWin"
-          $executable = Join-Path $root "donkey_sim.exe"
+          $executable = Join-Path $root "Donkey Sim.exe"
           $updater = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-updater.cmd"
           $checkLog = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-check.log"
           $updaterLog = Join-Path $env:RUNNER_TEMP "fake-donkey-sim-updater.log"

@@ -868,6 +868,89 @@ def test_stage_windows_falls_back_to_any_donkey_sim_exe(tmp_path, monkeypatch):
     assert staged["executable"].endswith("donkey_sim_launcher.exe")
 
 
+def test_stage_mac_discovers_renamed_app_bundle(tmp_path, monkeypatch):
+    payload = mac_zip_bytes(entry="DonkeySimMac/Donkey Sim.app/Contents/MacOS/Donkey Sim")
+    release = make_release(asset_size=len(payload), asset_sha256=digest_of(payload))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(payload))
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+
+    staged = updater.stage_update(release)
+
+    assert staged["executable"].endswith("Donkey Sim.app/Contents/MacOS/Donkey Sim")
+    assert os.access(staged["executable"], os.X_OK)
+
+
+def test_stage_mac_prefers_renamed_bundle_over_legacy(tmp_path, monkeypatch):
+    entries = {
+        "DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim": b"#!/bin/sh\nexit 0\n",
+        "DonkeySimMac/Donkey Sim.app/Contents/MacOS/Donkey Sim": b"#!/bin/sh\nexit 0\n",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+    release = make_release(asset_size=len(payload), asset_sha256=digest_of(payload))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(payload))
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+
+    staged = updater.stage_update(release)
+
+    assert staged["executable"].endswith("Donkey Sim.app/Contents/MacOS/Donkey Sim")
+
+
+def test_stage_mac_skips_macosx_apple_double_entries(tmp_path, monkeypatch):
+    entries = {
+        "__MACOSX/donkey_sim.app/Contents/MacOS/.__donkey_sim": b"junk",
+        "DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim": b"#!/bin/sh\nexit 0\n",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+    release = make_release(asset_size=len(payload), asset_sha256=digest_of(payload))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(payload))
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="darwin")
+
+    staged = updater.stage_update(release)
+
+    assert staged["executable"].endswith("DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim")
+
+
+def test_stage_windows_discovers_renamed_exe(tmp_path, monkeypatch):
+    files = {"DonkeySimWin/UnityCrashHandler64.exe": b"x", "DonkeySimWin/Donkey Sim.exe": b"x"}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+    release = make_release(asset_name="DonkeySimWin.zip", asset_size=len(payload), asset_sha256=digest_of(payload))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(payload))
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="win32")
+
+    staged = updater.stage_update(release)
+
+    assert staged["executable"].endswith("Donkey Sim.exe")
+
+
+def test_stage_linux_discovers_renamed_binary(tmp_path, monkeypatch):
+    files = {"DonkeySimLinux/readme.txt": b"hi", "DonkeySimLinux/Donkey Sim.x86_64": b"#!/bin/sh\n"}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+    release = make_release(asset_name="DonkeySimLinux.zip", asset_size=len(payload), asset_sha256=digest_of(payload))
+    install_urlopen(monkeypatch, lambda request, timeout: FakeResponse(payload))
+    updater = su.SimulatorUpdater(root=str(tmp_path), platform="linux")
+
+    staged = updater.stage_update(release)
+
+    assert staged["executable"].endswith("Donkey Sim.x86_64")
+    assert os.access(staged["executable"], os.X_OK)
+
+
 def test_stage_no_executable_raises_and_cleans_staging(tmp_path, monkeypatch):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
