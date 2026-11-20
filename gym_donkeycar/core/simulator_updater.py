@@ -67,6 +67,12 @@ _PLATFORM_ASSET_NAMES = {
     "linux2": "DonkeySimLinux.zip",
 }
 
+
+def _normalized_sim_name(name: str) -> str:
+    """Fold ``Donkey Sim`` and the legacy ``donkey_sim`` spellings together."""
+    return name.lower().replace(" ", "_")
+
+
 _SHA256_DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 _SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_TAG_LENGTH = 120
@@ -689,33 +695,44 @@ class SimulatorUpdater:
                     raise SimulatorUpdateError("failed to extract %r: %s" % (info.filename, exc))
 
     def _find_executable(self, directory: Path) -> Path:
-        """Locate the simulator executable inside an extracted archive or version dir."""
+        """Locate the simulator executable inside an extracted archive or version dir.
+
+        Release archives ship the app as ``Donkey Sim``; older ones used ``donkey_sim``.
+        Both spellings are accepted on every platform, with the current spelling preferred.
+        """
         platform = self.platform
         if platform == "darwin":
-            for app_dir in sorted(directory.rglob("donkey_sim.app")):
+            app_dirs = []
+            for pattern in ("Donkey Sim.app", "donkey_sim.app"):
+                app_dirs.extend(path for path in directory.rglob(pattern) if "__MACOSX" not in path.parts)
+            app_dirs.sort(key=lambda path: (path.name != "Donkey Sim.app", str(path)))
+            for app_dir in app_dirs:
                 macos_dir = app_dir / "Contents" / "MacOS"
                 if not macos_dir.is_dir():
                     continue
                 candidates = sorted(path for path in macos_dir.iterdir() if path.is_file())
                 if candidates:
-                    preferred = [path for path in candidates if path.name == "donkey_sim"]
+                    preferred = [path for path in candidates if _normalized_sim_name(path.name) == "donkey_sim"]
                     return (preferred or candidates)[0]
-            raise SimulatorUpdateError("no donkey_sim.app executable found in the downloaded archive")
+            raise SimulatorUpdateError("no Donkey Sim.app or donkey_sim.app executable found in the downloaded archive")
         if platform == "win32":
             executables = sorted(path for path in directory.rglob("*.exe") if path.is_file())
-            donkey_exes = [path for path in executables if path.name.lower().startswith("donkey_sim")]
+            donkey_exes = [path for path in executables if _normalized_sim_name(path.name).startswith("donkey_sim")]
             if donkey_exes:
-                preferred = [path for path in donkey_exes if path.name.lower() == "donkey_sim.exe"]
+                preferred = [path for path in donkey_exes if _normalized_sim_name(path.name) == "donkey_sim.exe"]
                 return (preferred or donkey_exes)[0]
             if executables:
                 return executables[0]
-            raise SimulatorUpdateError("no donkey_sim*.exe executable found in the downloaded archive")
+            raise SimulatorUpdateError("no Donkey Sim.exe or donkey_sim.exe executable found in the downloaded archive")
         if platform in ("linux", "linux2"):
-            candidates = sorted(path for path in directory.rglob("donkey_sim*") if path.is_file())
+            candidates = []
+            for pattern in ("Donkey Sim*", "donkey_sim*"):
+                candidates.extend(path for path in directory.rglob(pattern) if path.is_file())
+            candidates = sorted(set(candidates))
             if candidates:
-                preferred = [path for path in candidates if path.name == "donkey_sim"]
+                preferred = [path for path in candidates if _normalized_sim_name(path.name) == "donkey_sim"]
                 return (preferred or candidates)[0]
-            raise SimulatorUpdateError("no donkey_sim executable found in the downloaded archive")
+            raise SimulatorUpdateError("no Donkey Sim or donkey_sim executable found in the downloaded archive")
         raise SimulatorUpdateError("unsupported platform %r" % platform)
 
     def stage_update(self, release: Optional[SimulatorRelease] = None) -> Dict[str, Any]:
