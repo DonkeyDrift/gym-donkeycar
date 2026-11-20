@@ -71,7 +71,7 @@ def test_supply_defaults_adds_sim_update_keys():
         conf = {}
         supply_defaults(conf)
     assert conf["sim_update_mode"] == "off"
-    assert conf["sim_update_repo"] == "tawnkramer/gym-donkeycar"
+    assert conf["sim_update_repo"] == "DonkeyDrift/gym-donkeycar"
     assert conf["sim_update_root"] == os.path.expanduser("~/.donkeycar/simulators")
     assert conf["sim_update_cache_hours"] == 24
     assert conf["sim_update_keep_versions"] == 2
@@ -96,7 +96,7 @@ def test_managed_off_applies_staged_then_resolves_and_starts(env_mocks):
 
         # staged update is applied before the executable is resolved
         assert order.mock_calls == [mock.call.apply_staged(), mock.call.resolve(root=SIM_ROOT)]
-        updater_cls.assert_called_once_with(repo="tawnkramer/gym-donkeycar", root=SIM_ROOT, cache_seconds=86400.0)
+        updater_cls.assert_called_once_with(repo="DonkeyDrift/gym-donkeycar", root=SIM_ROOT, cache_seconds=86400.0)
         updater_cls.return_value.clean.assert_called_once_with(keep_versions=2)
         assert env.updater is updater_cls.return_value
         assert proc_cls.return_value.start.call_args.args[0] == SIM_PATH

@@ -52,17 +52,13 @@ else:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SIMULATOR_UPDATE_REPO = "tawnkramer/gym-donkeycar"
+DEFAULT_SIMULATOR_UPDATE_REPO = "DonkeyDrift/gym-donkeycar"
 
 _DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60
 _CHUNK_SIZE = 64 * 1024
-# /releases (list endpoint) rather than /releases/latest: the single "latest"
-# endpoint EXCLUDES pre-releases, and the publishing channel marks every
-# Tony-branch simulator build as a pre-release — /releases/latest would hide
-# them entirely (verified 2026-11-20: it 404s on a repo whose only release
-# is a pre-release). The list returns newest-first and excludes drafts.
-_API_RELEASES_URL = "https://api.github.com/repos/{repo}/releases?per_page=10"
-_USER_AGENT = "gym-donkeycar-simulator-updater/1.0 (+https://github.com/tawnkramer/gym-donkeycar)"
+_API_LATEST_URL = "https://api.github.com/repos/{repo}/releases/latest"
+_API_RELEASES_URL = "https://api.github.com/repos/{repo}/releases?per_page=30"
+_USER_AGENT = "gym-donkeycar-simulator-updater/1.0 (+https://github.com/DonkeyDrift/gym-donkeycar)"
 _VERSION_METADATA_NAME = "version.json"
 _TAG_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
@@ -364,6 +360,8 @@ class SimulatorUpdater:
     :param progress: optional callback ``progress(downloaded_bytes, total_bytes)`` called
         while a download is streaming.
     :param cache_seconds: how long a GitHub release lookup stays valid; ``0`` disables cache reads.
+    :param prerelease: when true, resolve updates from the newest pre-release instead of
+        the latest stable release.
     """
 
     def __init__(
@@ -374,6 +372,7 @@ class SimulatorUpdater:
         timeout: float = 15.0,
         progress: Optional[Callable[[int, int], None]] = None,
         cache_seconds: float = _DEFAULT_CACHE_TTL_SECONDS,
+        prerelease: bool = False,
     ):
         self.repo = repo
         self.root = _managed_root(root)
@@ -381,6 +380,10 @@ class SimulatorUpdater:
         self.timeout = float(timeout)
         self.progress = progress
         self.cache_seconds = max(float(cache_seconds), 0.0)
+        self.prerelease = bool(prerelease)
+
+    def _channel_name(self) -> str:
+        return "prerelease" if self.prerelease else "stable"
 
     @property
     def versions_dir(self) -> Path:
@@ -438,6 +441,8 @@ class SimulatorUpdater:
                 return None
         except (TypeError, ValueError):
             return None
+        if data.get("channel", "stable") != self._channel_name():
+            return None
         release_data = data.get("release")
         if not isinstance(release_data, dict):
             return None
@@ -483,23 +488,11 @@ class SimulatorUpdater:
         )
 
     def _write_cache(self, release: SimulatorRelease) -> None:
-        _atomic_write_json(self.cache_path, {"checked_at": _now_iso(), "release": _release_to_dict(release)})
+        _atomic_write_json(
+            self.cache_path, {"checked_at": _now_iso(), "channel": self._channel_name(), "release": _release_to_dict(release)}
+        )
 
-    def fetch_latest(self, force: bool = False) -> SimulatorRelease:
-        """Return the latest :class:`SimulatorRelease` for this platform.
-
-        The result is cached in ``last_check.json`` for 24 hours; pass ``force=True`` to
-        bypass the cache.  The GitHub API is called exactly once per attempt (no retries);
-        HTTP 403 / 429 / abuse-detection responses raise :class:`SimulatorRateLimitError`.
-        """
-        if not force:
-            cached = self._read_cached_release()
-            if cached is not None:
-                return cached
-        if not isinstance(self.repo, str) or "/" not in self.repo:
-            raise SimulatorUpdateError("invalid GitHub repository: %r" % (self.repo,))
-        self._asset_name()  # fail fast on unsupported platforms, before any network call
-        url = _API_RELEASES_URL.format(repo=self.repo)
+    def _fetch_api_json(self, url: str) -> Any:
         request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -523,29 +516,62 @@ class SimulatorUpdater:
         except (urllib.error.URLError, HTTPException, socket.timeout, TimeoutError, OSError) as exc:
             raise SimulatorDownloadError("cannot reach GitHub API at %s: %s" % (url, exc)) from exc
         try:
-            data = json.loads(payload.decode("utf-8"))
+            return json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             raise SimulatorUpdateError("GitHub API returned invalid JSON for %s: %s" % (url, exc)) from exc
+
+    def fetch_latest(self, force: bool = False) -> SimulatorRelease:
+        """Return the latest :class:`SimulatorRelease` for this platform.
+
+        The result is cached in ``last_check.json`` for 24 hours; pass ``force=True`` to
+        bypass the cache.  With ``prerelease=True`` the newest pre-release is resolved
+        instead of the latest stable release.  The GitHub API is called exactly once per
+        attempt (no retries); HTTP 403 / 429 / abuse-detection responses raise
+        :class:`SimulatorRateLimitError`.
+        """
+        if not force:
+            cached = self._read_cached_release()
+            if cached is not None:
+                return cached
+        if not isinstance(self.repo, str) or "/" not in self.repo:
+            raise SimulatorUpdateError("invalid GitHub repository: %r" % (self.repo,))
+        self._asset_name()  # fail fast on unsupported platforms, before any network call
+        if self.prerelease:
+            return self._fetch_latest_prerelease()
+        url = _API_LATEST_URL.format(repo=self.repo)
+        data = self._fetch_api_json(url)
+        release = self._release_from_api(data)
+        self._write_cache(release)
+        return release
+
+    def _fetch_latest_prerelease(self) -> SimulatorRelease:
+        url = _API_RELEASES_URL.format(repo=self.repo)
+        data = self._fetch_api_json(url)
         if not isinstance(data, list):
-            raise SimulatorUpdateError("unexpected GitHub API response format")
+            raise SimulatorUpdateError("unexpected GitHub API response format for %s" % url)
         asset_name = self._asset_name()
-        candidates = []
-        for entry in data:
-            if not isinstance(entry, dict) or entry.get("draft"):
-                continue
-            assets = entry.get("assets") or []
-            if any(isinstance(asset, dict) and asset.get("name") == asset_name for asset in assets):
-                candidates.append(entry)
-        # Pick by highest semantic tag, not by list order: the API sorts by
-        # created_at, and a release published from a long-standing draft
-        # carries an old created_at and can sort below an older tag
-        # (observed live 2026-11-20 with v1.4.0 above v1.4.1).
-        candidates.sort(key=_tag_sort_key, reverse=True)
-        release = self._release_from_api(candidates[0]) if candidates else None
-        if release is None:
-            raise SimulatorUpdateError(
-                "no release with a %r asset for platform %r in %s" % (asset_name, self.platform, self.repo)
+        candidates = [
+            item
+            for item in data
+            if isinstance(item, dict)
+            and item.get("prerelease") is True
+            and any(
+                isinstance(asset, dict) and asset.get("name") == asset_name
+                for asset in item.get("assets") or []
             )
+        ]
+        # Pick by highest semantic tag, not by list order: the API sorts by
+        # created_at, and a release published from a long-standing draft keeps
+        # an old created_at and can list below an older tag (observed live
+        # 2026-11-20: v1.4.0 sorted above v1.4.1). Candidates whose tags do
+        # not parse as semver sort below parseable ones.
+        candidates.sort(key=_tag_sort_key, reverse=True)
+        if not candidates:
+            raise SimulatorUpdateError(
+                "no pre-release with a %r asset for platform %r in the latest releases of %s"
+                % (asset_name, self.platform, self.repo)
+            )
+        release = self._release_from_api(candidates[0])
         self._write_cache(release)
         return release
 

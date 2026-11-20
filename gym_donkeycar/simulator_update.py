@@ -130,6 +130,7 @@ def _make_updater(args):
         platform=_detect_platform(),
         timeout=args.timeout,
         progress=progress,
+        prerelease=getattr(args, "prerelease", False),
     )
 
 
@@ -180,6 +181,7 @@ def _cmd_status(args) -> int:
         exe = resolve_managed_executable(args.root)
     except Exception:
         exe = None
+    print("channel:    {}".format("prerelease" if getattr(args, "prerelease", False) else "stable"))
     print("repo:       {}".format(args.repo))
     print("root:       {}".format(args.root))
     print("installed:  {}".format(_field(installed, "tag", "version") or "none"))
@@ -197,14 +199,26 @@ def _cmd_check(args) -> int:
         installed = _installed_version(updater)
     except Exception as exc:
         if getattr(args, "json", False):
-            print(json.dumps({"check_ok": False, "update_available": False, "error": str(exc)}, separators=(",", ":")))
+            channel = "prerelease" if getattr(args, "prerelease", False) else "stable"
+            print(
+                json.dumps(
+                    {"check_ok": False, "update_available": False, "channel": channel, "error": str(exc)},
+                    separators=(",", ":"),
+                )
+            )
             return 3
         return _error(args, "failed to read the installed version: {}.".format(exc))
     try:
         result = updater.check_for_update()
     except Exception as exc:
         if getattr(args, "json", False):
-            print(json.dumps({"check_ok": False, "update_available": False, "error": str(exc)}, separators=(",", ":")))
+            channel = "prerelease" if getattr(args, "prerelease", False) else "stable"
+            print(
+                json.dumps(
+                    {"check_ok": False, "update_available": False, "channel": channel, "error": str(exc)},
+                    separators=(",", ":"),
+                )
+            )
             return 3
         return _error(args, "failed to check for updates: {}.".format(exc), 3)
     available = False
@@ -225,6 +239,7 @@ def _cmd_check(args) -> int:
                     "update_available": bool(available),
                     "installed": installed,
                     "latest": latest,
+                    "channel": "prerelease" if getattr(args, "prerelease", False) else "stable",
                     "source": "github",
                 },
                 separators=(",", ":"),
@@ -407,6 +422,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser, include_defaults: boo
         help="network timeout in seconds" + (" (default: %s)" % DEFAULT_TIMEOUT if include_defaults else ""),
     )
     parser.add_argument("--no-color", action="store_true", default=no_color_default, help="disable colored output")
+    prerelease_default = False if include_defaults else argparse.SUPPRESS
+    parser.add_argument(
+        "--prerelease",
+        action="store_true",
+        default=prerelease_default,
+        help="resolve updates from the newest pre-release instead of the latest stable release",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
